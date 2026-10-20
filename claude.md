@@ -30,6 +30,8 @@ output including an illegible line.
 | Backend API | ✅ built | SQLite, 8 routes, all tested |
 | Frontend | ✅ built | Review + results screens, vite build passes |
 | Authentication (3 roles) | ✅ built, tested | Session 7. 77 API + 21 browser checks |
+| Docker hosting | ✅ built, tested | Session 8. One image, `localhost:8000` only, mock reader |
+| Patient view + PDF download | ✅ built, tested | Session 8. Workflow stage 4. 34 API + 11 browser checks |
 
 ### Live API status: verified
 
@@ -38,6 +40,121 @@ unverified SDK assumption (§6.4). Structured output, prompt caching, the spend
 ledger and the verbatim rule all confirmed on real calls.
 
 Spend so far: **$0.0686 across 2 calls**, cap $5.00.
+
+---
+
+## Session 8: Hosting in Docker, and the patient's PDF
+
+### Hosting
+
+The site now runs as **one container** (root `Dockerfile` + `docker-compose.yml`).
+FastAPI serves the built React app as well as the API, so both are on
+`http://localhost:8000` and the session cookie needs no CORS. The container uses
+`READER=mock`, so no key goes into it, and it is bound to `127.0.0.1`: doctors
+aren't vetted yet (open item 9). Three volumes hold SQLite, the uploads and the read
+cache. README §3.5 has the commands.
+
+None of the old deployment files worked. `backend/Dockerfile` copied from outside
+its build context and used Python 3.10, which can't parse `settings.py`.
+`requirements.txt` still listed torch and was missing anthropic, sqlalchemy, pandas
+and pyyaml. `docker-compose.yml` described Postgres, Redis and an `ml_server` that
+no longer exists. All three were replaced.
+
+**Avast intercepts HTTPS on this machine.** It re-signs every certificate with its
+own root, so `pip install` inside the build failed verification. The fix is
+`certs/*.crt` (gitignored, because each machine generates its own root): the build
+adds any extra CA it finds there. Turning Avast off was not needed.
+
+### Patient view and PDF download (Workflow stage 4)
+
+**A patient couldn't receive a prescription at all.** Nothing linked a prescription
+to a patient, and Stage 1 (sessions) isn't built. The smallest honest link: the doctor
+enters the patient's phone on the review screen (`Prescription.patient_phone`, saved
+with Confirm). A patient sees the prescription only when it is **confirmed**,
+**addressed** to a phone, and that phone is **their verified number**. Without the
+last check, anyone could register with someone else's number. Every other case is a
+`404`, so the API never confirms a prescription exists.
+
+**Patient wording follows Workflow §4.** The patient view drops
+`safer_alternative`. An alternative is a prescribing decision, and a patient reading
+one alone might switch. Each interaction says "discuss with your doctor or
+pharmacist". "No interactions found" always comes with the not-checked list.
+Unresolved lines say "could not be read reliably" and keep the verbatim reading.
+
+**The PDF is rendered from the same view as the screen** (`rx_pdf.py`, fpdf2), so
+the two can't disagree. Two problems were caught by reading the actual file:
+- The core PDF fonts are Latin-1 only, so a dash or a Devanagari name would break
+  them. The renderer uses DejaVu (installed in the image) or Arial, and falls back
+  to Latin-1 text rather than failing.
+- Times printed in UTC with no label: "08:14" was really 13:44 in India. They now
+  print in `DISPLAY_TZ`, labelled.
+
+**The verification ID is an HMAC** of the prescription id and the confirmation time,
+keyed by `SECRET_KEY`. There is **no QR code**: nothing exists yet for a QR to
+verify against.
+
+**`create_all` doesn't add columns to an existing table**, so the new column was
+missing from the existing databases. A startup step adds missing nullable columns.
+It stands in for migrations, which the project doesn't have. Verified on the Docker
+volume (`[DB] added column prescriptions.patient_phone`).
+
+Views, downloads and re-addressing are written to `auth_events` (`rx_viewed`,
+`rx_pdf_downloaded`, `rx_patient_set`). That's the "who saw what" trail from
+Workflow §8, until a real `AuditEvent` table exists.
+
+### Verified
+
+- **API, 34 checks** against the container:
+  - Unverified phone gets an empty inbox.
+  - Confirmation is required, and an unconfirmed page never appears.
+  - Other patients get 404 on the detail, PDF and image.
+  - A doctor gets 403 on patient routes, and anonymous requests get 401.
+  - Patients can't re-address a prescription. CSRF applies to the new PUT.
+  - Re-addressing moves access from the old patient to the new one.
+  - The PDF is real, served `no-store`, and named after the verification ID.
+- **Browser, 11 checks** (Playwright driving Chrome, patient at 390 px):
+  - An invalid phone shows an inline error on review.
+  - Confirm saves the phone.
+  - The unverified screen links to verification.
+  - The inbox opens the detail view, the image loads by cookie, and Download saves a PDF.
+  - No horizontal scroll, and no console errors other than the deliberate 422 and 404.
+
+### Phone codes by email (prototype)
+
+There is no SMS provider, so the patient's "verify your phone" step couldn't be done
+except by reading the server log. Phone codes are now **emailed**
+(`SMS_DELIVERY=email`). They go to the account's email if it has one, otherwise to
+`<digits>@sms.prescriptai.local`. Docker adds **Mailpit**, an open-source catch-all
+inbox at `localhost:8025`, so every code is readable there and none leaves the
+machine. The verify page links to it, and the patient's "Verify it now" sends the
+code and opens the code screen in one click. Fixed demo OTPs in `.env` were
+considered and **not** added: with an open-source inbox they aren't needed, and a
+fixed code that always works is a backdoor.
+
+In this prototype, a "verified phone" means verified by email. That's acceptable only
+until real SMS exists (open item 7).
+
+**Two bugs surfaced while wiring this up.** Both predate this change, but real email
+delivery made them reachable:
+- **A failed send could reveal which accounts exist.** `/password/forgot` caught only
+  `HTTPException`, so an SMTP error was a 500 for a real account and a 200 for a made-up
+  one. Delivery failures are now a 502 `HTTPException`, and `forgot` answers both
+  identically. Tested with Mailpit stopped.
+- **A failed send still started the resend cooldown** and cancelled the previous code:
+  the code row was committed before sending. Now it's committed only after a
+  successful send, and rolled back on failure.
+
+Verified: 13 API checks (including a mail outage) and 5 browser checks at 390 px.
+The browser checks caught one more problem: `AuthShell` hides its aside below `lg`,
+so the demo-inbox link was invisible on phones. It now sits inside the form.
+
+### Open items added
+
+11. **A confirmed prescription can still be edited.** Corrections apply after
+    confirmation, and the patient sees the change silently. Workflow §4 wants
+    immutable versions ("version 2, labelled as revised").
+12. **One page per prescription.** Multi-page sessions arrive with Stage 1.
+13. **No QR on the PDF** until a verification endpoint exists (Stage 5 or 6).
 
 ---
 
@@ -109,8 +226,8 @@ results.
 ### Open items added
 
 6. **Encrypt `mfa_secret` at rest** (KMS key) before production.
-7. **Real SMS / email delivery.** Phone codes always print to the console; email
-   codes do too unless `SMTP_HOST` is set.
+7. **Real SMS delivery.** Phone codes are emailed for the prototype (Session 8;
+   Mailpit in Docker). Replace `send_sms` with an SMS provider before real use.
 8. **Rate limiter is per-process memory.** Move it to Redis before running more
    than one worker.
 9. **No vetting of doctors or pharmacies.** Registration and licence numbers are

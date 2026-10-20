@@ -16,6 +16,8 @@ drug-interaction table, and puts every page in front of a doctor before it is us
 | **Cost** | ~$0.034 per prescription measured; cached re-runs are free |
 | **Stack** | Python 3.12+ · FastAPI · SQLite · React 19 + Vite + Tailwind |
 | **Accounts** | Doctor / patient / pharmacy sign-in, MFA, recovery. See [§6a](#6a-authentication). |
+| **Patients** | See and download (PDF) the prescriptions a doctor confirmed for their verified phone. See [§5](#5-api-reference). |
+| **Run it** | `docker compose up --build -d` → `http://localhost:8000`, demo inbox at `:8025`. See [§3.5](#5-hosting-the-whole-site-docker). |
 
 ---
 
@@ -138,7 +140,8 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 │       └── data/ddiDrugs.js  210 generics generated from DDI Database.json (autocomplete)
 │
 ├── pharmacy_dashboard/       ← separate React app (port 3001). Static demo data only, see §12
-└── docker-compose.yml        ← stale, see §12
+├── Dockerfile                one production image: API + built web app, see §3.5
+└── docker-compose.yml        local hosting on http://localhost:8000
 ```
 
 ---
@@ -200,8 +203,13 @@ npm run dev                       # → http://localhost:5173
 
 **First run:** open the site and **Create account → Doctor**. Prescription screens
 need a signed-in doctor. The email/phone verification code is **printed in the backend
-terminal** unless SMTP is configured (§8). Patients and pharmacies can register too,
-but their screens are placeholders until Workflow stages 4–7 are built.
+terminal** unless SMTP is configured (§8); under Docker every code, phone codes included,
+arrives in the demo inbox at `http://localhost:8025` instead.
+
+**Patients:** a patient verifies their phone, and the prescriptions a doctor confirmed
+for that number appear at `/patient`, each with a **Download PDF** button. The doctor
+enters the patient's phone on the review screen before confirming. Pharmacy screens are
+still placeholders until Workflow stages 5–7 are built.
 
 **The flow:** Upload → **Review** (image beside extraction; correct or confirm) →
 Results. History and Dashboard are computed from real stored records.
@@ -213,6 +221,36 @@ Use `http://localhost:5173`, not `127.0.0.1:5173`. The session cookie belongs to
 correctly return **no interactions**. To show S4 firing, use a known high-risk pair,
 e.g. `Cofarin 1mg` (Warfarin) + `ALFAM 400MG` (Ibuprofen) → SEVERE, GI bleeding. In
 the Interactions page, try `Warfarin` + `Ibuprofen` or `Sildenafil` + `Nitroglycerin`.
+
+### 5. Hosting the whole site (Docker)
+
+One container runs the API **and** serves the built web app, so both are on
+`http://localhost:8000` and the session cookie needs no CORS.
+
+```bash
+# once: a signing key for one-time and recovery codes (gitignored)
+python -c "import secrets;print('SECRET_KEY='+secrets.token_urlsafe(48))" > .env.docker
+
+docker compose up --build -d      # → http://localhost:8000
+# verification codes (email AND phone) → the demo inbox at http://localhost:8025
+docker compose down               # stop; data survives in the named volumes
+```
+
+- **Mock reader.** `READER=mock`: no API key enters the image or the container,
+  and nothing is spent. To read real images, set `READER: claude` and pass
+  `ANTHROPIC_API_KEY` in `.env.docker`; the spend cap still applies.
+- **Codes go to Mailpit**, an open-source local inbox (`axllent/mailpit`). It accepts
+  mail for any address and forwards none, so codes never leave the machine. Phone
+  codes are emailed too: to the account's email, or to `<digits>@sms.prescriptai.local`.
+  To send real email instead, set `SMTP_*` to a real server.
+- **Localhost only.** The port is bound to `127.0.0.1`. Don't expose it to a
+  network until doctors are vetted and records are owned per doctor (§12).
+  Anywhere served over HTTPS needs `COOKIE_SECURE=true` and its origin in
+  `CORS_ORIGINS`.
+- **State** lives in three volumes: `prescriptai_data` (SQLite),
+  `prescriptai_uploads` (prescription images) and `prescriptai_cache` (read cache
+  and spend ledger). `docker compose down -v` deletes all of it.
+- `pharmacy_dashboard/` isn't included (static demo data, §12).
 
 ---
 
@@ -252,6 +290,11 @@ Base URL `http://localhost:8000`. Interactive docs at `/docs`.
 | GET | `/api/prescriptions/{id}` | One prescription |
 | POST | `/api/prescriptions/{id}/corrections` | Log one doctor edit (`medicine_index`, `field`, `corrected_value`, `correction_type`). The predicted value is read server-side, never trusted from the client. The edit is also applied. |
 | POST | `/api/prescriptions/{id}/review` | Mark a page confirmed. Unchanged pages are labels too. |
+| PUT | `/api/prescriptions/{id}/patient` | `{"phone"}`: address the page to a patient (normalised to E.164; empty stops sharing). Logged as `rx_patient_set`. |
+| GET | `/api/patient/prescriptions` | **Patient.** Inbox: `phone_verified` plus the confirmed prescriptions addressed to their phone |
+| GET | `/api/patient/prescriptions/{id}` | **Patient.** The patient view: doctor, medicines, interactions, `not_checked`, `verification_id`. Logged as `rx_viewed`. |
+| GET | `/api/patient/prescriptions/{id}/image` | **Patient.** The original page |
+| GET | `/api/patient/prescriptions/{id}/pdf` | **Patient.** Download as PDF. Logged as `rx_pdf_downloaded`. |
 | POST | `/api/interactions/check` | Ad-hoc lookup by **generic** names. Bypasses S2/S3; for the manual lookup screen only. **Public.** |
 | GET | `/api/stats` | Totals, `coverage` (fraction CONFIRMED/PROBABLE), corrections logged, spend |
 | GET | `/api/corrections?limit` | The correction log (training corpus) |
@@ -263,6 +306,15 @@ directory. `corrected_by` / `reviewed_by` are the signed-in user's id, taken fro
 session and never from the request body. Every prescription response carries a
 `disclaimer` string. The auth routes are listed in §6a.
 
+**Patient access** (`backend/patient.py`): a patient sees a prescription only when a
+doctor has **confirmed** it, **addressed** it to a phone, and that phone is the
+patient's own **verified** number. Anything else is a `404`, so the API never
+confirms that a prescription exists. The patient view leaves out `safer_alternative`
+(a prescribing decision) and says "discuss with your doctor or pharmacist", per
+Workflow.md stage 4. The PDF (`backend/rx_pdf.py`, fpdf2) is rendered from that same
+view, prints times in `DISPLAY_TZ` (default `Asia/Kolkata`), and needs a Unicode TTF:
+DejaVu in the Docker image, Arial on Windows, or `PDF_FONT_REGULAR` / `PDF_FONT_BOLD`.
+
 **Every POST/PUT/PATCH/DELETE to `/api/*` must send `X-Requested-With: PrescriptAI`**
 (CSRF guard). `web_app` sets it on every request; curl and scripts must add it.
 
@@ -270,7 +322,7 @@ session and never from the request body. Every prescription response carries a
 
 - `prescriptions`: image path + sha256, `model` / `prompt_version` / `effort`,
   `raw_response`, `page_read_json`, `resolved_json`, header fields, cost,
-  `from_cache`, `reviewed_at` / `reviewed_by`
+  `from_cache`, `reviewed_at` / `reviewed_by`, `patient_phone`
 - `corrections`: before **and** after, `correction_type`
   (`misread` / `hallucinated` / `missed` / `wrong_field` / `other`), model
   confidence, match score, outcome, verification, who, when
@@ -353,7 +405,7 @@ the UI out. After login: doctor → `/upload`, patient → `/patient`,
 chemist → `/pharmacy`. Navbar links depend on the role.
 
 **Not production-ready yet** (see §12): codes are printed to the console when SMTP is
-missing, and SMS always goes there; the rate limiter is per-process memory; the TOTP
+missing, and phone codes are sent by email because there is no SMS provider; the rate limiter is per-process memory; the TOTP
 secret is stored unencrypted; doctors and pharmacies self-register with no licence
 check.
 
@@ -416,6 +468,10 @@ These come from real bugs and measured failures. The details are in `claude.md`.
 | `SESSION_COOKIE_NAME` | `prescriptai_session` | |
 | `CORS_ORIGINS` | localhost:5173, 127.0.0.1:5173, :3001, :3000 | origins allowed to send the session cookie |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | unset | email delivery for codes; unset → printed to the console |
+| `SMTP_STARTTLS` | `true` | `false` for a local server without TLS (Mailpit) |
+| `SMS_DELIVERY` | `email` | Prototype: phone codes are **emailed**, to the account's email or else `<digits>@SMS_EMAIL_DOMAIN`. `console` prints them instead. Needs `SMTP_HOST`. |
+| `SMS_EMAIL_DOMAIN` | `sms.prescriptai.local` | Stand-in address for phone-only accounts; only a catch-all inbox like Mailpit receives it |
+| `DEMO_INBOX_URL` | unset | Shown on the verify page as "Open the demo inbox" |
 | `REDIS_URL`, `CELERY_*`, `ML_SERVICE_URL` | | in `settings.py` but **unused**: scaffolding |
 
 ### Thresholds ([`ml_pipeline/config/thresholds.yaml`](ml_pipeline/config/thresholds.yaml))
@@ -483,7 +539,7 @@ patient data and are gitignored. Keep it that way.
 
 ## 11. Current status
 
-*As of the last journal entry (Session 6). `claude.md` is the source of truth.*
+*As of the last journal entry (Session 8). `claude.md` is the source of truth.*
 
 | Stage | Status |
 |---|---|
@@ -497,7 +553,10 @@ patient data and are gitignored. Keep it that way.
 | S5 review screen + correction log | ✅ |
 | Backend API | ✅ |
 | web_app | ✅ retheme done, `vite build` passes, renamed MedScript → PrescriptAI |
-| Authentication (all three roles) | ✅ built (Session 7): 77 API checks + 21 browser checks passed. Patient and pharmacy home pages are placeholders. |
+| Authentication (all three roles) | ✅ built (Session 7): 77 API checks + 21 browser checks passed. The pharmacy home page is a placeholder. |
+| Patient view + PDF download (Workflow stage 4) | ✅ built (Session 8): 34 API checks + 11 browser checks passed |
+| Phone codes by email (prototype) | ✅ built (Session 8): Mailpit demo inbox; 13 API + 5 browser checks. No real SMS yet. |
+| Docker hosting | ✅ one image, `localhost:8000`, mock reader (Session 8) |
 | pharmacy_dashboard | ⚠️ renamed only. Old dark theme, static BD demo data, not wired to the API |
 
 **Open items**
@@ -514,15 +573,12 @@ These come from the pre-v2 prototype. They are wrong, so don't trust them.
 
 | File | Problem |
 |---|---|
-| `backend/requirements.txt` | Missing `sqlalchemy`, `pyyaml`, `pandas`, `anthropic`, `python-dotenv`. Still lists `torch`, which is no longer used. |
 | `ml_pipeline/requirements.txt` | The old TrOCR stack (torch, transformers, opencv, pinned to Python 3.10). Not what the pipeline uses now. |
-| `docker-compose.yml` | Refers to `ml_pipeline/model_serving` (deleted) and an `ml_server` on 8001 (gone). Postgres, Redis and Celery are unused. DB name/user are still `medscript_*`, deliberately left alone so existing deployments don't break. |
-| `backend/Dockerfile` | `python:3.10-slim` won't parse `settings.py`, which needs 3.12. Also `COPY ../ml_pipeline` is outside the build context. |
 | `backend/config/settings.py` | `ML_SERVICE_URL`, JWT, Redis and Celery settings are unused scaffolding. |
 | `pharmacy_dashboard/` | Hardcoded demo queue with Bangladeshi brands (Napa, Esoral, ...). Fake confidences. |
 | `web_app/README.md` | Vite template boilerplate |
 | Upload with no CSVs | `resolve_page` sits outside the upload's `try`, so a missing dataset is a 500, not a 502 |
-| Auth: code delivery | No SMS provider; phone codes and (without `SMTP_HOST`) email codes are printed to the backend console. Swap `send_sms` in `backend/auth/notify.py`. |
+| Auth: code delivery | No SMS provider. For the prototype, phone codes are **sent by email** (`SMS_DELIVERY=email`), so a "verified" phone means verified by email. In Docker everything lands in Mailpit (`localhost:8025`) and nothing leaves the machine. For real SMS, replace `send_sms` in `backend/auth/notify.py`. |
 | Auth: rate limiting | In-process memory. Resets on restart and isn't shared between workers; move to Redis before scaling out. |
 | Auth: MFA secret | Stored unencrypted (`users.mfa_secret`). Encrypt with a KMS-held key before production. |
 | Auth: vetting | Doctors and pharmacies self-register; the registration / licence number is not checked against any registry (Workflow.md §10 Q5). |

@@ -1,0 +1,16 @@
+# Secrets and patient data never go into the image.
+.env
+.env.*
+*.db
+backend/uploads/
+ml_pipeline/.cache/
+
+**/node_modules/
+**/dist/
+**/__pycache__/
+*.pyc
+.git/
+.vscode/
+VLM_CHECK/
+pharmacy_dashboard/
+docs/

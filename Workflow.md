@@ -330,8 +330,8 @@ New entities are marked **new**. Existing tables are in `backend/models.py`.
 | Diagnosis extraction | ⬜ new: `PageRead` has no diagnosis field. Needs a schema + prompt change (bump `PROMPT_VERSION`). |
 | Patient-friendly medicine information | ⬜ new: needs a content source; the brand dataset gives composition only |
 | Accounts, phone / email verification | ✅ built: see README §6a |
-| Patient app (prescriptions, sharing) | ⬜ new: `/patient` is a placeholder page today |
-| PDF download | ⬜ new |
+| Patient app (prescriptions, sharing) | 🟡 partly built: inbox and prescription view (stage 4). Sharing by OTP (stage 5) is new. Until stage 1 exists the doctor enters the patient's phone on the review screen. |
+| PDF download | ✅ built: doctor details, medicines, interactions with what was not checked, the original page, a verification ID and the AI notice. No QR yet: there is no verification endpoint for one to point at. |
 | OTP sharing, 15-min access window, revocation | ⬜ new |
 | Pharmacy app on the real API | ⬜ new: `pharmacy_dashboard/` is static demo data today |
 | Pack verification by QR | ⬜ new |

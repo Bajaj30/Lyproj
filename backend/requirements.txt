@@ -1,13 +1,17 @@
-# PrescriptAI Backend Dependencies
-fastapi>=0.104.1
-uvicorn[standard]>=0.24.0
-python-multipart>=0.0.6
-httpx>=0.25.2
-python-decouple>=3.8
-Pillow>=10.2.0
-numpy>=1.24.4
-torch>=2.0.1
-networkx>=3.2.1
-rapidfuzz>=3.5.2
-python-Levenshtein>=0.23.0
-pydantic>=2.0
+# PrescriptAI backend + ml_pipeline (serving path only). Versions are the ones
+# the project was verified against. No torch/cv2: TrOCR is out of the serving
+# path, and S0 normalisation is Pillow only.
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.6
+sqlalchemy==2.0.52
+pydantic==2.13.4
+python-dotenv==1.0.0
+anthropic==1.2.0
+pandas==2.3.3
+numpy==2.2.6
+Pillow==11.3.0
+PyYAML==6.0.1
+rapidfuzz==3.14.3
+networkx==3.5
+fpdf2==2.8.9

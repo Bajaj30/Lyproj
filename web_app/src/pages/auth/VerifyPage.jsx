@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
 import { Navigate, useLocation, useNavigate } from 'react-router-dom'
-import { MailCheck, Loader2, RotateCw, Terminal } from 'lucide-react'
+import { MailCheck, Loader2, RotateCw, Terminal, Inbox, ExternalLink } from 'lucide-react'
 import { AuthShell, CodeField, Alert } from '../../components/auth/AuthUI'
 import { confirmVerification, sendVerification, ROLE_HOME } from '../../services/auth'
-import { apiError } from '../../services/api'
+import { apiError, getHealth } from '../../services/api'
 import { useAuthStore } from '../../store/useAuthStore'
 
 /** Confirm an email or phone with the 6-digit code sent to it. */
@@ -20,6 +20,12 @@ export default function VerifyPage() {
   const [error, setError] = useState(null)
   const [notice, setNotice] = useState(state?.sentTo ? `Code sent to ${state.sentTo}.` : null)
   const [cooldown, setCooldown] = useState(state?.sentTo ? 60 : 0)
+  // Set when codes go to a local demo inbox (Mailpit) instead of real mail/SMS.
+  const [demoInbox, setDemoInbox] = useState(null)
+
+  useEffect(() => {
+    getHealth().then((h) => setDemoInbox(h.demo_inbox_url)).catch(() => {})
+  }, [])
 
   useEffect(() => {
     if (cooldown <= 0) return undefined
@@ -28,8 +34,13 @@ export default function VerifyPage() {
   }, [cooldown])
 
   const home = ROLE_HOME[user?.role] || '/'
+  // Where to go afterwards: the page that sent us here (an in-app path only),
+  // else home after sign-up, else the account page.
+  const r = state?.returnTo
+  const returnTo = typeof r === 'string' && r.startsWith('/') && !r.startsWith('//') ? r : null
+  const done = returnTo || (state?.welcome ? home : '/account')
   if (!channel || (channel === 'email' ? user?.email_verified : user?.phone_verified)) {
-    return <Navigate to={state?.welcome ? home : '/account'} replace />
+    return <Navigate to={done} replace />
   }
   const what = channel === 'email' ? 'email address' : 'phone number'
   const destination = channel === 'email' ? user.email : user.phone
@@ -39,7 +50,7 @@ export default function VerifyPage() {
     setBusy(true); setError(null)
     try {
       setUser(await confirmVerification(channel, code))
-      navigate(state?.welcome ? home : '/account', { replace: true, state: { verified: channel } })
+      navigate(done, { replace: true, state: { verified: channel } })
     } catch (err) {
       setError(apiError(err)); setCode('')
     } finally { setBusy(false) }
@@ -62,16 +73,31 @@ export default function VerifyPage() {
     <AuthShell
       kicker={state?.welcome ? 'Account created · one more step' : 'Verify'}
       title={`Confirm your ${what}`}
-      blurb={`Enter the 6-digit code we sent to ${destination}. It expires in 10 minutes.`}
-      aside={
+      blurb={channel === 'phone'
+        // Prototype: phone codes are delivered by email; the notice says where.
+        ? `Enter the 6-digit code for ${destination}. It expires in 10 minutes.`
+        : `Enter the 6-digit code we sent to ${destination}. It expires in 10 minutes.`}
+      aside={!demoInbox && (
         <Alert kind="info" title="Running locally?">
           <span className="inline-flex items-center gap-1.5"><Terminal size={14} /> Without SMTP or an SMS provider configured,</span>{' '}
           codes are printed in the backend terminal instead of being sent.
         </Alert>
-      }
+      )}
     >
       <form onSubmit={submit} className="space-y-5" noValidate>
         {notice && !error && <Alert kind="success">{notice}</Alert>}
+        {/* In the form, not the aside: AuthShell hides its aside on phones,
+            and a phone is exactly where a patient opens this page. */}
+        {demoInbox && (
+          <Alert kind="info" title="Demo mode">
+            Codes, including phone codes, arrive by email in the demo inbox. Nothing is
+            sent to a real phone or mailbox.{' '}
+            <a href={demoInbox} target="_blank" rel="noreferrer"
+               className="inline-flex items-center gap-1 font-semibold underline">
+              <Inbox size={14} /> Open the demo inbox <ExternalLink size={12} />
+            </a>
+          </Alert>
+        )}
         {error && <Alert>{error}</Alert>}
         <CodeField label="Verification code" value={code} onChange={setCode} />
         <button type="submit" disabled={busy || code.length !== 6} className="btn-primary w-full">
@@ -82,7 +108,7 @@ export default function VerifyPage() {
                   className="inline-flex items-center gap-1.5 font-medium text-care-700 hover:text-care-800 disabled:text-ink-400">
             <RotateCw size={15} /> {cooldown > 0 ? `Resend in ${cooldown}s` : 'Resend code'}
           </button>
-          <button type="button" onClick={() => navigate(state?.welcome ? home : '/account', { replace: true })}
+          <button type="button" onClick={() => navigate(done, { replace: true })}
                   className="btn-ghost -mr-3">
             Do this later
           </button>

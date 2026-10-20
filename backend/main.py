@@ -51,6 +51,8 @@ load_env()
 
 from auth import Role, User, current_user, require_roles  # noqa: E402
 from auth import router as auth_router  # noqa: E402
+from auth.routes import _event, norm_phone  # noqa: E402
+from patient import router as patient_router  # noqa: E402
 from config.database import Base, engine, get_db  # noqa: E402
 from config.settings import settings  # noqa: E402
 from drug_interaction.interaction_inference import InteractionChecker  # noqa: E402
@@ -91,8 +93,10 @@ async def csrf_guard(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware, allow_origins=settings.CORS_ORIGINS, allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
+    expose_headers=["Content-Disposition"],  # the PDF download's filename
 )
 app.include_router(auth_router)
+app.include_router(patient_router)
 
 doctor_only = require_roles(Role.DOCTOR)
 
@@ -100,10 +104,30 @@ _reader = None
 _checker = None
 
 
+def _add_missing_columns() -> None:
+    """create_all() never alters an existing table, so a column added to a model
+    after a database was created is missing from it. Add those columns (all are
+    nullable). A stand-in for real migrations, which this prototype does not have."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not insp.has_table(table.name):
+                continue
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name not in have and col.nullable:
+                    conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN '
+                                      f'{col.name} {col.type.compile(engine.dialect)}'))
+                    print(f"[DB] added column {table.name}.{col.name}", flush=True)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     global _reader, _checker
     Base.metadata.create_all(bind=engine)
+    _add_missing_columns()
     print(f"[API] reader={READER_KIND} prompt={PROMPT_VERSION}", flush=True)
     _reader = build_reader(READER_KIND)
     _checker = InteractionChecker()
@@ -173,6 +197,7 @@ class PrescriptionOut(BaseModel):
     medicines: List[MedicineOut] = []
     interactions: InteractionOutcome
     reviewed: bool = False
+    patient_phone: Optional[str] = None
     disclaimer: str
 
 
@@ -226,6 +251,7 @@ def _to_out(rx: Prescription) -> PrescriptionOut:
         medicines=[MedicineOut(**m) for m in meds],
         interactions=InteractionOutcome(**inter) if inter else InteractionOutcome(),
         reviewed=rx.reviewed_at is not None,
+        patient_phone=rx.patient_phone,
         disclaimer=DISCLAIMER,
     )
 
@@ -242,6 +268,9 @@ def health():
         "spend_usd": round(guard.total_usd(), 4),
         "spend_cap_usd": guard.cap_usd,
         "spend_remaining_usd": round(guard.remaining_usd(), 4),
+        # Where demo codes can be read (Mailpit), so the UI can link to it.
+        # Unset outside a demo setup.
+        "demo_inbox_url": os.environ.get("DEMO_INBOX_URL") or None,
     }
 
 
@@ -376,6 +405,29 @@ def mark_reviewed(
     return {"ok": True, "reviewed_at": rx.reviewed_at.isoformat()}
 
 
+class PatientPhoneIn(BaseModel):
+    phone: Optional[str] = Field(None, description="Empty to stop sharing with a patient")
+
+
+@app.put("/api/prescriptions/{prescription_id}/patient")
+def set_patient_phone(
+    prescription_id: str, body: PatientPhoneIn, request: Request,
+    db: Session = Depends(get_db), user: User = Depends(doctor_only),
+):
+    """Address a prescription to a patient's phone. It reaches their app once the
+    page is also confirmed, and only if they have verified that number."""
+    rx = db.get(Prescription, prescription_id)
+    if not rx:
+        raise HTTPException(404, "Prescription not found")
+    phone = norm_phone(body.phone) if (body.phone or "").strip() else None
+    if phone != rx.patient_phone:
+        rx.patient_phone = phone
+        # Who sent patient data where is part of the audit trail.
+        _event(db, request, "rx_patient_set", user.id, f"{rx.id} -> {phone or 'none'}")
+        db.commit()
+    return {"ok": True, "patient_phone": rx.patient_phone}
+
+
 class InteractionCheckIn(BaseModel):
     medicines: List[str] = Field(description="Generic/molecule names")
 
@@ -449,6 +501,29 @@ def uploaded_image(name: str, user: User = Depends(doctor_only)):
     if path.parent != UPLOAD_DIR.resolve() or not path.is_file():
         raise HTTPException(404, "Not found")
     return FileResponse(path)
+
+
+# ─── the built frontend (production image only) ─────────────────────────────
+# Serving the React build from this process puts the UI and the API on one
+# origin, so the session cookie and the CSRF header need no CORS at all. In
+# development WEB_DIST is unset and Vite serves the UI on :5173 as before.
+# Registered last so it can never shadow an /api or /uploads route.
+
+WEB_DIST = os.environ.get("WEB_DIST")
+if WEB_DIST and (Path(WEB_DIST) / "index.html").is_file():
+    from fastapi.staticfiles import StaticFiles
+
+    _dist = Path(WEB_DIST).resolve()
+    app.mount("/assets", StaticFiles(directory=_dist / "assets"), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa(full_path: str):
+        if full_path.startswith(("api/", "uploads/")):
+            raise HTTPException(404, "Not found")
+        path = (_dist / full_path).resolve()
+        if full_path and path.is_file() and _dist in path.parents:
+            return FileResponse(path)  # favicon, robots.txt, other public/ files
+        return FileResponse(_dist / "index.html")  # client-side routes
 
 
 if __name__ == "__main__":

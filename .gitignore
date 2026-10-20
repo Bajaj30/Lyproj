@@ -23,6 +23,7 @@ build/
 .env
 .env.local
 .env.production
+.env.docker
 
 # Database
 *.db
@@ -81,3 +82,6 @@ ml_pipeline/data/ocr_dataset/
 ml_pipeline/data/rxhandbd/
 test_*.png
 *.ipynb
+
+# Per-machine root CAs for the Docker build (see certs/README.md)
+certs/*.crt

@@ -1,27 +1,18 @@
 import { Link } from 'react-router-dom'
 import {
-  FileText, ShieldPlus, Share2, ScanBarcode, KeyRound, BadgeCheck, ShieldCheck, ChevronRight,
+  FileText, ShieldPlus, ScanBarcode, KeyRound, BadgeCheck, ShieldCheck, ChevronRight,
   CheckCircle2, Circle, Clock,
 } from 'lucide-react'
 import { useAuthStore } from '../../store/useAuthStore'
 
 /**
- * Landing pages for the two stakeholders whose product surface is not built
- * yet (Workflow.md §9). They say so plainly. Showing sample prescriptions here
- * would be the same fabricated-result mistake the doctor screens were cleaned
- * of — so there are none.
+ * Landing page for the stakeholder whose product surface is not built yet
+ * (Workflow.md §9): the pharmacy. It says so plainly. Showing sample
+ * prescriptions here would be the same fabricated-result mistake the doctor
+ * screens were cleaned of — so there are none. (The patient has a real home
+ * page now: pages/patient/.)
  */
 const CONTENT = {
-  patient: {
-    kicker: 'Patient',
-    title: 'Your prescriptions',
-    blurb: 'Once a doctor finalises a prescription for your phone number, it appears here.',
-    coming: [
-      { icon: FileText, title: 'Read and download', desc: 'Your medicines, dosage and duration, with the original handwritten page. (Workflow stage 4)' },
-      { icon: ShieldPlus, title: 'Understand interactions', desc: 'Plain-language warnings for medicines that should not be combined, and what was not checked.' },
-      { icon: Share2, title: 'Share with a pharmacy', desc: 'Give the chemist a one-time code for 15 minutes of read-only access. (Stage 5)' },
-    ],
-  },
   chemist: {
     kicker: 'Pharmacy',
     title: 'Dispensing desk',

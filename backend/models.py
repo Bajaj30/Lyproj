@@ -104,6 +104,11 @@ class Prescription(Base):
     reviewed_at = Column(DateTime(timezone=True))
     reviewed_by = Column(String)
 
+    # Who the doctor addressed this to (E.164). A patient sees the prescription
+    # once it is reviewed AND this matches their verified phone (patient.py).
+    # Stands in for Workflow stage 1's session until sessions exist.
+    patient_phone = Column(String, index=True)
+
     corrections = relationship(
         "Correction", back_populates="prescription", cascade="all, delete-orphan"
     )

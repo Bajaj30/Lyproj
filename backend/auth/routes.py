@@ -386,8 +386,20 @@ def _issue_code(db: Session, user: User, purpose: CodePurpose, channel: str) -> 
         code_hash=hash_code(code, purpose.value, user.id), created_at=now,
         expires_at=now + timedelta(minutes=CODE_TTL_MIN),
     ))
+    db.flush()
+    try:
+        sent_to = deliver(channel, destination, purpose.value, code, CODE_TTL_MIN, email=user.email)
+    except Exception as exc:
+        # Nothing was sent, so keep nothing: the rollback drops the new code and
+        # restores the previous one, and no resend cooldown starts. Raised as an
+        # HTTPException so /password/forgot answers a failed send exactly as it
+        # answers an unknown account (a raw 500 would reveal the account).
+        db.rollback()
+        print(f"[AUTH] delivery failed ({channel}, {purpose.value}): {exc}", flush=True)
+        raise HTTPException(502, "We couldn't send the code just now. Please try again in a minute.")
     db.commit()
-    deliver(channel, destination, purpose.value, code, CODE_TTL_MIN)
+    if channel == "phone" and sent_to != destination:   # prototype: SMS went by email
+        return f"{_mask('phone', destination)} (by email to {_mask('email', sent_to)})"
     return _mask(channel, destination)
 
 

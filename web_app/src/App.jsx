@@ -15,11 +15,14 @@ import ForgotPasswordPage from './pages/auth/ForgotPasswordPage'
 import VerifyPage from './pages/auth/VerifyPage'
 import AccountPage from './pages/auth/AccountPage'
 import RoleHomePage from './pages/auth/RoleHomePage'
+import PatientHomePage from './pages/patient/PatientHomePage'
+import PatientPrescriptionPage from './pages/patient/PatientPrescriptionPage'
 import { useAuthStore } from './store/useAuthStore'
 
 // Prescription screens hold patient data: doctors only (the API enforces the
 // same rule on every request — this just avoids rendering a screen that 403s).
 const doctor = (el) => <RequireAuth roles={['doctor']}>{el}</RequireAuth>
+const patient = (el) => <RequireAuth roles={['patient']}>{el}</RequireAuth>
 
 export default function App() {
   const refresh = useAuthStore((s) => s.refresh)
@@ -44,7 +47,8 @@ export default function App() {
         <Route path="history" element={doctor(<HistoryPage />)} />
         <Route path="dashboard" element={doctor(<DashboardPage />)} />
 
-        <Route path="patient" element={<RequireAuth roles={['patient']}><RoleHomePage role="patient" /></RequireAuth>} />
+        <Route path="patient" element={patient(<PatientHomePage />)} />
+        <Route path="patient/prescriptions/:id" element={patient(<PatientPrescriptionPage />)} />
         <Route path="pharmacy" element={<RequireAuth roles={['chemist']}><RoleHomePage role="chemist" /></RequireAuth>} />
       </Route>
     </Routes>

@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { AlertTriangle, CheckCircle2, Loader2, ShieldAlert } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Loader2, ShieldAlert, Smartphone } from 'lucide-react'
 import MedicineCard from '../components/MedicineCard'
 import {
-  getPrescription, submitCorrection, markReviewed, imageUrl,
+  getPrescription, submitCorrection, markReviewed, setPatientPhone, imageUrl, apiError,
 } from '../services/api'
 
 /**
@@ -33,9 +33,15 @@ export default function ReviewPage() {
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
   const [editing, setEditing] = useState(null)
+  const [phone, setPhone] = useState('')
+  const [phoneError, setPhoneError] = useState(null)
 
   const load = async () => {
-    try { setRx(await getPrescription(id)) }
+    try {
+      const data = await getPrescription(id)
+      setRx(data)
+      setPhone(data.patient_phone ?? '')
+    }
     catch (e) { setError(e?.response?.data?.detail ?? e.message) }
   }
   useEffect(() => { load() }, [id])
@@ -58,9 +64,19 @@ export default function ReviewPage() {
     record({ medicine_index: index, field: 'brand', corrected_value: value,
              correction_type: 'misread', note: 'picked from candidates' })
 
+  // The phone is saved with the confirmation: a prescription reaches the
+  // patient's app only once it is both addressed and confirmed.
   const confirmPage = async () => {
     setBusy(true)
-    try { await markReviewed(id); navigate(`/results/${id}`) }
+    setPhoneError(null)
+    try {
+      if (phone.trim() !== (rx.patient_phone ?? '')) {
+        try { await setPatientPhone(id, phone.trim()) }
+        catch (e) { setPhoneError(apiError(e)); return }
+      }
+      await markReviewed(id)
+      navigate(`/results/${id}`)
+    }
     catch (e) { setError(e?.response?.data?.detail ?? e.message) }
     finally { setBusy(false) }
   }
@@ -132,6 +148,19 @@ export default function ReviewPage() {
             <img src={src} alt="Uploaded prescription"
                  className="w-full rounded-xl border border-ink-200 bg-white p-1 shadow-clinical" />
           )}
+          <label htmlFor="patient-phone" className="mt-4 flex items-center gap-1.5 text-sm font-semibold text-ink-800">
+            <Smartphone className="h-4 w-4 text-care-700" /> Send to patient's phone
+          </label>
+          <input
+            id="patient-phone" type="tel" inputMode="tel" autoComplete="off"
+            placeholder="+91 98765 43210" value={phone}
+            onChange={(e) => { setPhone(e.target.value); setPhoneError(null) }}
+            className="input-field mt-1"
+            aria-invalid={!!phoneError} aria-describedby="patient-phone-help"
+          />
+          <p id="patient-phone-help" className={`mt-1 text-xs ${phoneError ? 'text-vital-700' : 'text-ink-500'}`}>
+            {phoneError ?? 'Optional. The patient sees it in their app after you confirm, once they verify this number.'}
+          </p>
           <button
             type="button" onClick={confirmPage} disabled={busy}
             className="btn-confirm mt-4"

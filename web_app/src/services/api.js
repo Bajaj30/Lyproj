@@ -1,6 +1,8 @@
 import axios from 'axios'
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+// `??`, not `||`: the production build sets VITE_API_URL="" so the API is the
+// page's own origin (FastAPI serves both), and an empty string must survive.
+const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
 // A real VLM read takes 10-30s on a dense page. The old 30s default was long
 // enough to time out on exactly the prescriptions that matter most.
@@ -77,6 +79,53 @@ export const markReviewed = async (prescriptionId) => {
   // The reviewer is whoever is signed in — the backend takes it from the session.
   const { data } = await api.post(`/api/prescriptions/${prescriptionId}/review`)
   return data
+}
+
+/** Address a prescription to a patient's phone (empty string stops sharing). */
+export const setPatientPhone = async (prescriptionId, phone) => {
+  const { data } = await api.put(`/api/prescriptions/${prescriptionId}/patient`, { phone })
+  return data
+}
+
+// ── patient app (Workflow stage 4) ───────────────────────────────────────────
+
+export const getMyPrescriptions = async () => {
+  const { data } = await api.get('/api/patient/prescriptions')
+  return data
+}
+
+export const getMyPrescription = async (id) => {
+  const { data } = await api.get(`/api/patient/prescriptions/${id}`)
+  return data
+}
+
+export const myPrescriptionImageUrl = (id) => `${API_BASE}/api/patient/prescriptions/${id}/image`
+
+/**
+ * Fetch the PDF and hand it to the browser as a download. Fetched rather than
+ * linked so a failure shows as an error on the page, not as a JSON tab.
+ */
+export const downloadMyPrescriptionPdf = async (id) => {
+  let res
+  try {
+    res = await api.get(`/api/patient/prescriptions/${id}/pdf`, { responseType: 'blob' })
+  } catch (err) {
+    // With responseType 'blob' an error body is a Blob too; decode it so
+    // apiError() can read the API's message.
+    const body = err?.response?.data
+    if (body instanceof Blob) {
+      try { err.response.data = JSON.parse(await body.text()) } catch { /* not JSON */ }
+    }
+    throw err
+  }
+  const name = /filename="([^"]+)"/.exec(res.headers['content-disposition'] ?? '')?.[1]
+    ?? `prescription-${id}.pdf`
+  const url = URL.createObjectURL(res.data)
+  const a = Object.assign(document.createElement('a'), { href: url, download: name })
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 export const getCorrections = async (limit = 100) => {
