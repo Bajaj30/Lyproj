@@ -3,8 +3,12 @@ The downloadable prescription PDF (Workflow.md stage 4).
 
 Renders a `patient.PatientPrescription` — the same view the patient app shows —
 so the file and the screen cannot say different things. Contents, in order:
-doctor details, patient and date, medicines, interactions (with what was not
-checked), the AI/doctor-review notice, and the original handwritten page.
+doctor details, patient and date, diagnosis (unless the doctor hid it), medicines,
+interactions (with what was not checked), the AI/doctor-review notice, a QR code
+that opens the public verification page, and every original handwritten page.
+
+The QR encodes PUBLIC_BASE_URL/check/<verification ID>. That page answers only
+"genuine, by whom, current version or superseded" — never the contents.
 
 Fonts: the PDF core fonts are Latin-1 only, so a dash, a curly quote or a
 Devanagari name would break them. A Unicode TTF is used when one is installed
@@ -19,7 +23,7 @@ import os
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from fpdf import FPDF
@@ -120,10 +124,39 @@ class _Doc(FPDF):
         self.multi_cell(0, 5, self.t(value), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
-def render(view, image_path: Optional[Path], generated_at: datetime) -> bytes:
+def _qr_png(url: str) -> Optional[io.BytesIO]:
+    try:
+        import segno
+    except ImportError:   # the ID is still printed; only the QR is missing
+        return None
+    buf = io.BytesIO()
+    segno.make(url, error="m").save(buf, kind="png", scale=6, border=2)
+    buf.seek(0)
+    return buf
+
+
+def render(view, images: Sequence[Path], generated_at: datetime,
+           verify_url: Optional[str] = None) -> bytes:
     pdf = _Doc(view.verification_id, generated_at)
     pdf.alias_nb_pages()
     pdf.add_page()
+
+    if verify_url:
+        qr = _qr_png(verify_url)
+        if qr:
+            size, top = 30, pdf.get_y()
+            pdf.image(qr, x=pdf.w - pdf.r_margin - size, y=top - 2, w=size, h=size)
+            pdf.font(7, color=MUTED)
+            pdf.set_xy(pdf.w - pdf.r_margin - size - 6, top + size - 1)
+            pdf.cell(size + 6, 3.5, pdf.t("Scan to verify"), align="C")
+            pdf.set_xy(pdf.l_margin, top)
+            pdf.set_right_margin(pdf.r_margin + size + 4)
+
+    if getattr(view, "revised", False):
+        pdf.para(f"Version {view.version}: revised by the doctor. Earlier versions no longer apply.",
+                 size=10, bold=True, color=VITAL)
+        if getattr(view, "change_note", None):
+            pdf.para(f"What changed: {view.change_note}", size=9.5, color=MUTED)
 
     # doctor + patient
     pdf.heading("Prescribed by")
@@ -134,12 +167,15 @@ def render(view, image_path: Optional[Path], generated_at: datetime) -> bytes:
         pdf.field("Registration no.", view.doctor.registration_no)
     if view.prescriber_as_written and (not view.doctor or view.prescriber_as_written != view.doctor.name):
         pdf.field("Written on page", view.prescriber_as_written)
-    reviewed = datetime.fromisoformat(view.reviewed_at).astimezone(DISPLAY_TZ)
-    pdf.field("Reviewed", f"{reviewed:%d %b %Y}, by the doctor above")
+    reviewed = datetime.fromisoformat(view.finalised_at).astimezone(DISPLAY_TZ)
+    pdf.field("Finalised", f"{reviewed:%d %b %Y}, by the doctor above (version {view.version})")
 
     pdf.heading("Patient")
     pdf.field("Name", view.patient_name or "Not written on the page")
     pdf.field("Date on page", view.date)
+    pdf.set_right_margin(18)   # back to full width below the QR
+    if getattr(view, "diagnosis", None):
+        pdf.field("Diagnosis", view.diagnosis)
 
     # medicines
     pdf.heading(f"Medicines ({len(view.medicines)})")
@@ -186,10 +222,11 @@ def render(view, image_path: Optional[Path], generated_at: datetime) -> bytes:
     pdf.multi_cell(0, 4.8, pdf.t(view.notice), fill=True, padding=3,
                    new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # the original page, on its own page and scaled to fit
-    if image_path:
+    # every original page, each on its own page and scaled to fit
+    for n, image_path in enumerate(images, 1):
         pdf.add_page()
-        pdf.heading("Original handwritten prescription")
+        pdf.heading("Original handwritten prescription"
+                    + (f" (page {n} of {len(images)})" if len(images) > 1 else ""))
         img = Image.open(image_path)
         img.load()
         img = img.convert("RGB")

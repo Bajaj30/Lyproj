@@ -50,7 +50,7 @@ export default function PatientHomePage() {
         <h1 className="mt-2 font-display text-4xl font-normal text-ink-900">Your prescriptions</h1>
         <p className="mt-2 text-ink-600">
           Signed in as <span className="font-medium text-ink-900">{user.full_name}</span>.
-          Prescriptions appear here once your doctor confirms them for your phone number.
+          Prescriptions appear here once your doctor finalises them for your phone number.
         </p>
       </header>
 
@@ -108,10 +108,16 @@ export default function PatientHomePage() {
                       {p.doctor_name ?? 'Your doctor'}
                     </p>
                     <p className="text-sm text-ink-600">
-                      {p.date ? `Dated ${p.date}` : `Confirmed ${formatDay(p.reviewed_at)}`}
+                      {p.date ? `Dated ${p.date}` : `Finalised ${formatDay(p.finalised_at)}`}
                       {' · '}{p.medicine_count} medicine{p.medicine_count === 1 ? '' : 's'}
                     </p>
-                    {risk && <span className={`chip mt-2 ${risk.cls}`}>{risk.label}</span>}
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {p.version > 1 && <span className="chip border-amber-300 bg-amber-50 text-amber-900">Revised · v{p.version}</span>}
+                      {risk && <span className={`chip ${risk.cls}`}>{risk.label}</span>}
+                      {p.shared_now && <span className="chip border-care-300 bg-care-50 text-care-800">Shared with a pharmacy now</span>}
+                      {p.dispensing_state === 'partial' && <span className="chip">Partly dispensed</span>}
+                      {p.dispensing_state === 'complete' && <span className="chip">Dispensed</span>}
+                    </div>
                   </div>
                   <ChevronRight size={18} className="shrink-0 text-ink-400" />
                 </Link>

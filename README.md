@@ -102,11 +102,14 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 │   ├── vlm/
 │   │   ├── prompts.py        S1 system prompt; PROMPT_VERSION + fingerprint
 │   │   ├── page_reader.py    S1 readers: MockPageReader, ClaudePageReader, CachedPageReader
+│   │   ├── pack_reader.py    stage 6: reads a photographed pack label (mock / Claude)
 │   │   ├── spend.py          spend ledger + hard cap
 │   │   └── vocab.py          S2 (+ calls S3): resolve_page()
 │   ├── normalise/
 │   │   ├── india_medicines.py   S2/S3 data: brand indices, compositions, NLEM gate
 │   │   └── drug_names.py        salt/ester stripping, INN↔USAN synonyms
+│   ├── dispense/compare.py   stage 6: pack (QR / photo / typed) vs prescription
+│   ├── tests/                test_dispense.py + fixtures/india (TEST FIXTURE data)
 │   ├── drug_interaction/
 │   │   ├── build_knowledge_graph.py   loads DDI Database.json → NetworkX graph
 │   │   ├── interaction_inference.py   S4: InteractionChecker
@@ -116,8 +119,16 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 │       └── india/*.csv                     NOT committed, see §9
 │
 ├── backend/                  ← FastAPI app (port 8000)
-│   ├── main.py               all routes; wires S0→S4; READER env var; CSRF + CORS
-│   ├── models.py             SQLAlchemy: Prescription, Correction, InteractionRun
+│   ├── main.py               app, CSRF + CORS, page routes, stats, /api/verify, backfill
+│   ├── pipeline.py           reader / checker / pack reader singletons; READER=auto
+│   ├── consultations.py      stages 1–3: consultations, pages, review, finalise
+│   ├── patient.py            stages 4–5: patient view, PDF, share by OTP, revoke
+│   ├── pharmacy.py           stages 5–7: redeem, pack checks, dispensing record
+│   ├── access.py             grant status, OTP hashing, dispensing state
+│   ├── views.py              shared response shapes, verification IDs
+│   ├── rx_pdf.py             the prescription PDF (fpdf2 + segno QR)
+│   ├── models.py             SQLAlchemy: consultations, versions, pages, corrections,
+│   │                         interaction runs, grants, dispense checks, records
 │   ├── auth/                 accounts for every stakeholder (§6a)
 │   │   ├── routes.py         /api/auth/*; current_user / require_roles dependencies
 │   │   ├── models.py         users, auth_sessions, one_time_codes, mfa_challenges,
@@ -130,9 +141,13 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 │
 ├── web_app/                  ← main React app (port 5173). Clinical light theme.
 │   └── src/
-│       ├── pages/            Home, Upload, Review, Results, Interactions, History, Dashboard
+│       ├── pages/            Home, Upload (new consultation), Consultation (review +
+│       │                     finalise), Results, Interactions, History, Dashboard,
+│       │                     VerifyDocument (public /check/:id)
+│       ├── pages/patient/    inbox, prescription (share with pharmacy, revoke)
+│       ├── pages/pharmacy/   desk (redeem code), grant (check packs), records
 │       ├── components/       Layout, Navbar, MedicineCard, MedicalBackdrop, Logo
-│       ├── pages/auth/       Login, Register, ForgotPassword, Verify, Account, RoleHome
+│       ├── pages/auth/       Login, Register, ForgotPassword, Verify, Account
 │       ├── components/auth/  AuthUI (shared form pieces), RequireAuth (route guard)
 │       ├── services/api.js   axios client: cookie + CSRF header, 120s timeout
 │       ├── services/auth.js  /api/auth/* calls, ROLE_HOME
@@ -161,7 +176,8 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 
 ```bash
 cp .env.example .env
-# edit .env: set ANTHROPIC_API_KEY, and PRESCRIPTAI_SPEND_CAP if you want a lower cap
+# optional: paste ANTHROPIC_API_KEY into .env. Left empty, everything runs on the
+# mock reader at zero cost and the UI labels it "Demo reader".
 ```
 
 ### 2. Python dependencies
@@ -178,18 +194,19 @@ pip install fastapi "uvicorn[standard]" python-multipart sqlalchemy pydantic \
 
 ```bash
 cd backend
-python main.py                    # real reader → http://localhost:8000  (docs at /docs)
+python main.py                    # → http://localhost:8000  (docs at /docs)
 ```
 
-To run with no key and no cost, use the mock reader:
+`READER` defaults to `auto`: the Claude reader when `ANTHROPIC_API_KEY` is set in
+`.env`, the mock reader when it is empty. Adding the key and restarting is the only
+step needed to start reading real handwriting and pack labels. `/api/health`
+reports `reader` and `reader_is_mock`, and the UI shows a "Demo reader" banner on
+the mock. `READER` also accepts `claude`, `mock` or `mock_negative` (returns "not a
+prescription") to force one.
 
-```bash
-READER=mock python main.py        # bash
-$env:READER="mock"; python main.py   # PowerShell
-```
-
-`READER` accepts `claude` (default), `mock`, or `mock_negative` (returns
-"not a prescription").
+No medicine CSVs on this machine? Point the loader at the test fixture (15 brands,
+every row marked `TEST FIXTURE`, never for real use):
+`PRESCRIPTAI_DATA_DIR=ml_pipeline/tests/fixtures/india`.
 
 ### 4. Web app
 
@@ -236,9 +253,9 @@ docker compose up --build -d      # → http://localhost:8000
 docker compose down               # stop; data survives in the named volumes
 ```
 
-- **Mock reader.** `READER=mock`: no API key enters the image or the container,
-  and nothing is spent. To read real images, set `READER: claude` and pass
-  `ANTHROPIC_API_KEY` in `.env.docker`; the spend cap still applies.
+- **Reader.** `READER: auto`: with no `ANTHROPIC_API_KEY` in `.env.docker` the
+  container runs the mock reader and spends nothing. Add the key to `.env.docker`
+  and `docker compose up -d` to read real images; the spend cap still applies.
 - **Codes go to Mailpit**, an open-source local inbox (`axllent/mailpit`). It accepts
   mail for any address and forwards none, so codes never leave the machine. Phone
   codes are emailed too: to the account's email, or to `<digits>@sms.prescriptai.local`.
@@ -284,49 +301,78 @@ Base URL `http://localhost:8000`. Interactive docs at `/docs`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/health` | Status, reader kind, prompt version, spend / cap / remaining. **Public.** |
-| POST | `/api/prescriptions/upload` | Multipart `image`. Runs S0→S4, persists, returns `PrescriptionOut`. `502` if the reader fails (spend cap, auth, API). |
-| GET | `/api/prescriptions?limit&offset` | Newest first |
-| GET | `/api/prescriptions/{id}` | One prescription |
-| POST | `/api/prescriptions/{id}/corrections` | Log one doctor edit (`medicine_index`, `field`, `corrected_value`, `correction_type`). The predicted value is read server-side, never trusted from the client. The edit is also applied. |
-| POST | `/api/prescriptions/{id}/review` | Mark a page confirmed. Unchanged pages are labels too. |
-| PUT | `/api/prescriptions/{id}/patient` | `{"phone"}`: address the page to a patient (normalised to E.164; empty stops sharing). Logged as `rx_patient_set`. |
-| GET | `/api/patient/prescriptions` | **Patient.** Inbox: `phone_verified` plus the confirmed prescriptions addressed to their phone |
-| GET | `/api/patient/prescriptions/{id}` | **Patient.** The patient view: doctor, medicines, interactions, `not_checked`, `verification_id`. Logged as `rx_viewed`. |
-| GET | `/api/patient/prescriptions/{id}/image` | **Patient.** The original page |
-| GET | `/api/patient/prescriptions/{id}/pdf` | **Patient.** Download as PDF. Logged as `rx_pdf_downloaded`. |
-| POST | `/api/interactions/check` | Ad-hoc lookup by **generic** names. Bypasses S2/S3; for the manual lookup screen only. **Public.** |
-| GET | `/api/stats` | Totals, `coverage` (fraction CONFIRMED/PROBABLE), corrections logged, spend |
-| GET | `/api/corrections?limit` | The correction log (training corpus) |
+| GET | `/api/health` | Status, `reader`, `reader_is_mock`, `api_key_configured`, prompt version, spend. **Public.** |
+| GET | `/api/verify/{verification_id}` | What the PDF's QR opens: genuine?, doctor, registration no., version, `superseded`. **No patient data, no medicines.** **Public**, throttled. |
+| POST | `/api/interactions/check` | Ad-hoc lookup by **generic** names. Bypasses S2/S3. **Public.** |
+| | **Doctor** (`backend/consultations.py`, `main.py`) | |
+| POST | `/api/consultations` | Start one: `patient_name`, `patient_phone`, optional `clinic_address` (defaults to the profile's) |
+| GET | `/api/consultations` | This doctor's consultations |
+| GET | `/api/consultations/{id}` | Working copy: every page, every medicine, ONE interaction check across all pages, `unresolved`, `versions` |
+| PATCH | `/api/consultations/{id}` | Patient, clinic, `diagnosis`, `diagnosis_visibility` (`patient` / `patient_and_pharmacy` / `hidden`), `allow_substitution` |
+| POST | `/api/consultations/{id}/pages` | Multipart `image`. Runs S0→S4 on it and rechecks the whole consultation. `502` if the reader fails. |
+| DELETE | `/api/consultations/{id}/pages/{page_id}` | Only before the first finalise |
+| POST | `/api/consultations/{id}/medicines` | Add a line the reader missed (`missed` correction). The name goes through S3. |
+| POST | `/api/prescriptions/{page_id}/medicines/{i}/remove` · `/restore` | Strike a line not on the page (`hallucinated` correction) |
+| POST | `/api/prescriptions/{page_id}/corrections` | One field edit. A corrected **name** is re-resolved through S3, so ingredients and the interaction check follow it. |
+| POST | `/api/consultations/{id}/finalise` | Writes immutable version N. `422` while a line is AMBIGUOUS, or unresolved without `acknowledge_unresolved`. `409` if nothing changed. |
+| GET | `/api/consultations/{id}/versions/{n}` | A finalised snapshot |
+| POST | `/api/prescriptions/upload` | Legacy single page: opens a consultation around it |
+| GET | `/api/prescriptions`, `/api/prescriptions/{id}` | Pages (this doctor's) |
+| GET | `/api/stats`, `/api/corrections` | Coverage, totals; the correction corpus (this doctor's) |
+| | **Patient** (`backend/patient.py`) | |
+| GET | `/api/patient/prescriptions` | Inbox: finalised prescriptions whose latest version is addressed to their **verified** phone |
+| GET | `/api/patient/prescriptions/{id}` | Latest version: `revised`, diagnosis (unless hidden), medicines with `dispensed`, interactions, `not_checked`, `shares`, `dispensing` |
+| GET | `/api/patient/prescriptions/{id}/pages/{n}/image`, `/pdf` | Original pages; the PDF (with QR) |
+| POST | `/api/patient/prescriptions/{id}/share` | A 6-digit code for one pharmacy (redeem within 5 min). Cancels any unused earlier code. |
+| POST | `/api/patient/grants/{id}/revoke` | End a pharmacy's access now |
+| | **Pharmacy** (`backend/pharmacy.py`) | |
+| POST | `/api/pharmacy/redeem` | `{"otp"}` → read-only access for 15 min. Single use. Wrong codes all get one answer; 5 failures lock the account for 15 min. |
+| GET | `/api/pharmacy/grants`, `/api/pharmacy/grants/{id}` | Open and ended access. A grant that has ended is **`410`** on every route. |
+| GET | `/api/pharmacy/grants/{id}/pages/{n}/image` | Original page, `no-store`, during access only |
+| POST | `/api/pharmacy/grants/{id}/checks` | One pack: `method` = `qr` (`qr_text`) / `photo` (`image`) / `manual` (`brand`, `generic_name`, `strength`, `form`), plus `batch`, `expiry`, `quantity` |
+| POST | `/api/pharmacy/grants/{id}/checks/{check_id}/confirm` | Chemist confirms an orange result. Red / grey can never be confirmed. |
+| GET | `/api/pharmacy/records` | The minimal dispensing record; survives the end of access |
 
-**Access:** every `/api/prescriptions*`, `/api/stats` and `/api/corrections` route
-requires a signed-in **doctor** (`401` signed out, `403` other roles). Images are
-served at `/uploads/{id}.{ext}` through a doctor-only route, not an open static
-directory. `corrected_by` / `reviewed_by` are the signed-in user's id, taken from the
-session and never from the request body. Every prescription response carries a
-`disclaimer` string. The auth routes are listed in §6a.
+**Access.** Doctor routes need a signed-in **doctor** and see only their own
+consultations (anything else is `404`); pages backfilled from before ownership was
+recorded stay visible to every doctor. Images are served at `/uploads/{name}` to the
+owning doctor only. `corrected_by` / `finalised_by` come from the session, never the
+request body.
 
-**Patient access** (`backend/patient.py`): a patient sees a prescription only when a
-doctor has **confirmed** it, **addressed** it to a phone, and that phone is the
-patient's own **verified** number. Anything else is a `404`, so the API never
-confirms that a prescription exists. The patient view leaves out `safer_alternative`
-(a prescribing decision) and says "discuss with your doctor or pharmacist", per
-Workflow.md stage 4. The PDF (`backend/rx_pdf.py`, fpdf2) is rendered from that same
-view, prints times in `DISPLAY_TZ` (default `Asia/Kolkata`), and needs a Unicode TTF:
-DejaVu in the Docker image, Arial on Windows, or `PDF_FONT_REGULAR` / `PDF_FONT_BOLD`.
+**Versions.** Finalising writes a `ConsultationVersion` snapshot. Patients and
+pharmacies read **only** snapshots, so a doctor's later edit reaches nobody until it
+is finalised as the next version, labelled "revised". Re-addressing to another phone
+also takes effect only on finalise.
+
+**Patient access:** the latest version is addressed to the patient's own **verified**
+phone, or `404`. The patient view leaves out `safer_alternative` and says "discuss
+with your doctor or pharmacist" (Workflow stage 4). The PDF (`backend/rx_pdf.py`) is
+rendered from that same view, includes every page and a QR to
+`PUBLIC_BASE_URL/check/<id>`, and prints times in `DISPLAY_TZ`.
+
+**Dispensing** (`ml_pipeline/dispense/compare.py`): a pack is compared on
+**composition and strength**, never the brand string: `match`, `substitute`,
+`strength_mismatch` (chemist must confirm), `wrong_medicine` (blocked),
+`could_not_verify` (blocked, never shown as a match). Dispensing carries across
+versions by what the medicine is, so a revision does not un-dispense a pack.
 
 **Every POST/PUT/PATCH/DELETE to `/api/*` must send `X-Requested-With: PrescriptAI`**
 (CSRF guard). `web_app` sets it on every request; curl and scripts must add it.
 
 **Database** (`backend/models.py`, SQLite at `backend/prescriptai.db` by default):
 
-- `prescriptions`: image path + sha256, `model` / `prompt_version` / `effort`,
-  `raw_response`, `page_read_json`, `resolved_json`, header fields, cost,
-  `from_cache`, `reviewed_at` / `reviewed_by`, `patient_phone`
+- `consultations`: owner, patient name + phone, clinic, diagnosis + visibility,
+  `allow_substitution`, `status` (draft / finalised / revising), `current_version`
+- `consultation_versions`: immutable snapshots, `verification_id`, `patient_phone`
+- `prescriptions` (one row per **page**): image path + sha256, `model` /
+  `prompt_version` / `effort`, `raw_response`, `page_read_json`, `resolved_json`,
+  header fields, cost, `from_cache`, `reviewed_at` / `reviewed_by`,
+  `consultation_id`, `page_no`
+- `access_grants`, `dispense_checks`, `dispensing_records`: Workflow stages 5–7
 - `corrections`: before **and** after, `correction_type`
   (`misread` / `hallucinated` / `missed` / `wrong_field` / `other`), model
   confidence, match score, outcome, verification, who, when
-- `interaction_runs`: S4 result per prescription
+- `interaction_runs`: S4 result per page and per consultation (across all pages)
 - Auth tables: see §6a
 
 ---
@@ -456,8 +502,11 @@ These come from real bugs and measured failures. The details are in `claude.md`.
 
 | Variable | Default | Used by |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | none | S1 Claude reader (required unless `READER=mock`) |
-| `READER` | `claude` | backend: `claude` / `mock` / `mock_negative` |
+| `ANTHROPIC_API_KEY` | empty | Claude page + pack readers. Empty = mock reader. |
+| `READER` | `auto` | `auto` (Claude if a key is set, else mock) / `claude` / `mock` / `mock_negative` |
+| `PRESCRIPTAI_DATA_DIR` | `ml_pipeline/data/india` | where the two medicine CSVs are |
+| `SHARE_REDEEM_MINUTES` / `SHARE_WINDOW_MINUTES` | `5` / `15` | pharmacy code lifetime / access window |
+| `PUBLIC_BASE_URL` | `http://localhost:8000` | what the PDF's QR opens |
 | `PRESCRIPTAI_SPEND_CAP` | `30` (USD) | spend guard; refuses calls past this |
 | `DATABASE_URL` | `sqlite:///backend/prescriptai.db` | backend |
 | `SQL_ECHO` | off | set `1` to log SQL |
@@ -553,11 +602,16 @@ patient data and are gitignored. Keep it that way.
 | S5 review screen + correction log | ✅ |
 | Backend API | ✅ |
 | web_app | ✅ retheme done, `vite build` passes, renamed MedScript → PrescriptAI |
-| Authentication (all three roles) | ✅ built (Session 7): 77 API checks + 21 browser checks passed. The pharmacy home page is a placeholder. |
+| Authentication (all three roles) | ✅ built (Session 7): 77 API checks + 21 browser checks passed |
 | Patient view + PDF download (Workflow stage 4) | ✅ built (Session 8): 34 API checks + 11 browser checks passed |
 | Phone codes by email (prototype) | ✅ built (Session 8): Mailpit demo inbox; 13 API + 5 browser checks. No real SMS yet. |
 | Docker hosting | ✅ one image, `localhost:8000`, mock reader (Session 8) |
-| pharmacy_dashboard | ⚠️ renamed only. Old dark theme, static BD demo data, not wired to the API |
+| Consultations, multi-page, finalise + versions, diagnosis (stages 1–3) | ✅ built (Session 9) |
+| Pharmacy sharing by OTP, pack checks, expiry, dispensing record (stages 5–7) | ✅ built (Session 9), in `web_app` under `/pharmacy` |
+| QR verification (`/check/<id>`) | ✅ built (Session 9) |
+| Session 9 checks | 23 dispensing unit checks, 98 API checks (incl. the upload-XSS regression), 38 browser checks under the new CSP, on the mock reader + test fixture |
+| Upload stored-XSS (UPDATES_SINCE_LOGIN §6) | ✅ fixed (Session 9): extension from the real image format, images served with a fixed type + `nosniff`, security headers + CSP on every response |
+| pharmacy_dashboard | ⚠️ superseded by `/pharmacy` in web_app. Static BD demo data; safe to delete |
 
 **Open items**
 
@@ -582,7 +636,9 @@ These come from the pre-v2 prototype. They are wrong, so don't trust them.
 | Auth: rate limiting | In-process memory. Resets on restart and isn't shared between workers; move to Redis before scaling out. |
 | Auth: MFA secret | Stored unencrypted (`users.mfa_secret`). Encrypt with a KMS-held key before production. |
 | Auth: vetting | Doctors and pharmacies self-register; the registration / licence number is not checked against any registry (Workflow.md §10 Q5). |
-| Auth: record ownership | Any signed-in doctor sees every prescription. Per-doctor sessions arrive with Workflow stage 1. |
+| Patient medicine information | "What it is used for" needs a content source; only the composition is shown. |
+| Pack QR codes | Only JSON, `Key: value`, GS1 (batch/expiry only) and plain-text payloads are parsed. A link-only QR is reported as "could not verify" (Workflow §10 Q9). |
+| Pharmacy code lock | Per account and per IP, in process memory, like the other rate limits. |
 | Auth: no automated tests in repo | The 77 API + 21 browser checks ran from a scratch script. `fastapi.testclient` is broken here (`httpx` 0.28 vs Starlette 0.35). |
 
 ---
@@ -619,8 +675,8 @@ Continuous improvement is driven by the correction log (ARCH §16):
 `prompt_version`, confidence and alternatives populated, then count corrections by
 type. Build the regression suite first.
 
-Other next steps: rebuild `pharmacy_dashboard` on the real API, fix the requirements
-files and Docker setup, find a way to distribute the medicine CSVs, and possibly
+Other next steps: delete `pharmacy_dashboard` (superseded), fix the requirements
+files, find a way to distribute the medicine CSVs, and possibly
 expand DDI coverage for acute outpatient drugs.
 
 ---

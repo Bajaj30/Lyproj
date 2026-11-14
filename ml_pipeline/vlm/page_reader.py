@@ -107,6 +107,7 @@ class MockPageReader:
             patient_name="Ms. Prathna",
             prescriber_name="Dr. R. Keshwani",
             date="15-03-17",
+            diagnosis="AGE",
             medicines=[
                 MedicineLine(
                     line_index=0,
@@ -330,6 +331,21 @@ class ClaudePageReader:
         return response.parsed_output
 
 
+def resolve_reader_kind(kind: str = "auto") -> str:
+    """"auto" means: the real reader when an API key is configured, else the mock.
+
+    This is the slot the API key drops into. With no key the whole product still
+    runs end to end on the mock reader, at zero cost, and says so (/api/health
+    reports `reader`). Add ANTHROPIC_API_KEY to .env and restart: nothing else
+    changes.
+    """
+    if kind != "auto":
+        return kind
+    from env import api_key_configured
+
+    return "claude" if api_key_configured() else "mock"
+
+
 def build_reader(
     kind: str = "claude",
     model: str = DEFAULT_MODEL,
@@ -338,6 +354,7 @@ def build_reader(
 ) -> PageReader:
     """One place to construct the reader, so swapping it is a single argument."""
     inner: PageReader
+    kind = resolve_reader_kind(kind)
     if kind == "mock":
         inner = MockPageReader()
     elif kind == "mock_negative":
@@ -354,7 +371,7 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description="Run S1 on one or more pages.")
     ap.add_argument("images", nargs="+")
-    ap.add_argument("--reader", default="claude", choices=["claude", "mock", "mock_negative"])
+    ap.add_argument("--reader", default="auto", choices=["auto", "claude", "mock", "mock_negative"])
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--effort", default=DEFAULT_EFFORT)
     ap.add_argument("--no-cache", action="store_true")

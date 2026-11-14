@@ -14,15 +14,20 @@ import RegisterPage from './pages/auth/RegisterPage'
 import ForgotPasswordPage from './pages/auth/ForgotPasswordPage'
 import VerifyPage from './pages/auth/VerifyPage'
 import AccountPage from './pages/auth/AccountPage'
-import RoleHomePage from './pages/auth/RoleHomePage'
 import PatientHomePage from './pages/patient/PatientHomePage'
 import PatientPrescriptionPage from './pages/patient/PatientPrescriptionPage'
+import ConsultationPage from './pages/ConsultationPage'
+import VerifyDocumentPage from './pages/VerifyDocumentPage'
+import PharmacyHomePage from './pages/pharmacy/PharmacyHomePage'
+import PharmacyGrantPage from './pages/pharmacy/PharmacyGrantPage'
+import DispensingRecordsPage from './pages/pharmacy/DispensingRecordsPage'
 import { useAuthStore } from './store/useAuthStore'
 
 // Prescription screens hold patient data: doctors only (the API enforces the
 // same rule on every request — this just avoids rendering a screen that 403s).
 const doctor = (el) => <RequireAuth roles={['doctor']}>{el}</RequireAuth>
 const patient = (el) => <RequireAuth roles={['patient']}>{el}</RequireAuth>
+const chemist = (el) => <RequireAuth roles={['chemist']}>{el}</RequireAuth>
 
 export default function App() {
   const refresh = useAuthStore((s) => s.refresh)
@@ -33,6 +38,9 @@ export default function App() {
       <Route path="/" element={<Layout />}>
         <Route index element={<HomePage />} />
         <Route path="interactions" element={<InteractionsPage />} />
+        {/* Public: what the QR on a prescription PDF opens. Shows no patient data. */}
+        <Route path="check" element={<VerifyDocumentPage />} />
+        <Route path="check/:vid" element={<VerifyDocumentPage />} />
 
         <Route path="login" element={<LoginPage />} />
         <Route path="register" element={<RegisterPage />} />
@@ -41,6 +49,7 @@ export default function App() {
         <Route path="account" element={<RequireAuth><AccountPage /></RequireAuth>} />
 
         <Route path="upload" element={doctor(<UploadPage />)} />
+        <Route path="consultations/:id" element={doctor(<ConsultationPage />)} />
         <Route path="results/:id" element={doctor(<ResultsPage />)} />
         <Route path="review/:id" element={doctor(<ReviewPage />)} />
         <Route path="results" element={doctor(<ResultsPage />)} />
@@ -49,7 +58,9 @@ export default function App() {
 
         <Route path="patient" element={patient(<PatientHomePage />)} />
         <Route path="patient/prescriptions/:id" element={patient(<PatientPrescriptionPage />)} />
-        <Route path="pharmacy" element={<RequireAuth roles={['chemist']}><RoleHomePage role="chemist" /></RequireAuth>} />
+        <Route path="pharmacy" element={chemist(<PharmacyHomePage />)} />
+        <Route path="pharmacy/grants/:id" element={chemist(<PharmacyGrantPage />)} />
+        <Route path="pharmacy/records" element={chemist(<DispensingRecordsPage />)} />
       </Route>
     </Routes>
   )

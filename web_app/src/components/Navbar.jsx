@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
   Home, ScanLine, ShieldPlus, History, Activity, Menu, X, FileText, Store, LogIn, UserPlus,
-  UserRound, LogOut, ShieldCheck,
+  UserRound, LogOut, ShieldCheck, ClipboardList,
 } from 'lucide-react'
 import Logo from './Logo'
 import { getHealth } from '../services/api'
@@ -16,12 +16,13 @@ const INTERACTIONS = { to: '/interactions', label: 'Interactions', icon: ShieldP
 const LINKS = {
   anon:    [HOME, INTERACTIONS],
   doctor:  [HOME,
-            { to: '/upload',    label: 'Scan',      icon: ScanLine },
+            { to: '/upload',    label: 'New',       icon: ScanLine },
             INTERACTIONS,
-            { to: '/history',   label: 'Records',   icon: History },
+            { to: '/history',   label: 'Consultations', icon: History },
             { to: '/dashboard', label: 'Dashboard', icon: Activity }],
   patient: [HOME, { to: '/patient', label: 'My prescriptions', icon: FileText }, INTERACTIONS],
-  chemist: [HOME, { to: '/pharmacy', label: 'Dispensing', icon: Store }, INTERACTIONS],
+  chemist: [HOME, { to: '/pharmacy', label: 'Dispensing', icon: Store },
+            { to: '/pharmacy/records', label: 'Records', icon: ClipboardList }, INTERACTIONS],
 }
 
 export default function Navbar() {

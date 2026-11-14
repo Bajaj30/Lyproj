@@ -10,9 +10,8 @@ actually happened, including the things that did not work.
 
 ## Where the project is right now
 
-**Track A (the reader) is built and tested, except for the live API call.**
-Tracks B and C are unblocked: `MockPageReader` exists and produces realistic
-output including an illegible line.
+**Every Workflow.md stage is built** (Session 9). The product runs end to end on
+the mock reader; adding `ANTHROPIC_API_KEY` to `.env` switches it to real reads.
 
 | Stage | Status | Notes |
 |---|---|---|
@@ -32,6 +31,10 @@ output including an illegible line.
 | Authentication (3 roles) | ✅ built, tested | Session 7. 77 API + 21 browser checks |
 | Docker hosting | ✅ built, tested | Session 8. One image, `localhost:8000` only, mock reader |
 | Patient view + PDF download | ✅ built, tested | Session 8. Workflow stage 4. 34 API + 11 browser checks |
+| Consultations, finalise + versions, diagnosis | ✅ built, tested | Session 9. Workflow stages 1–3 |
+| Pharmacy: OTP sharing, pack checks, expiry, record | ✅ built, tested | Session 9. Stages 5–7. 98 API + 38 browser checks |
+| Upload stored-XSS | ✅ fixed | Session 9. Real-format extensions, safe image serving, CSP + security headers |
+| Reader slot for the API key | ✅ | Session 9. `READER=auto`: mock until `ANTHROPIC_API_KEY` is set |
 
 ### Live API status: verified
 
@@ -40,6 +43,111 @@ unverified SDK assumption (§6.4). Structured output, prompt caching, the spend
 ledger and the verbatim rule all confirmed on real calls.
 
 Spend so far: **$0.0686 across 2 calls**, cap $5.00.
+
+---
+
+## Session 9: The rest of the workflow, with a slot for the API key
+
+Built every Workflow.md stage that was still open (1, 3, 5, 6, 7), plus diagnosis
+extraction and the QR verification page. Nothing here calls the API: the key is
+the one thing left to add.
+
+### The API key slot
+
+`READER` now defaults to `auto`: Claude when `ANTHROPIC_API_KEY` holds a real-looking
+key, the mock otherwise (`env.api_key_configured()`, which treats the
+`.env.example` placeholder as empty). `.env.example` ships the key **empty**, and
+docker-compose passes `READER: auto`. Adding the key and restarting is the whole
+switch. On the mock, `/api/health` says `reader_is_mock`, and a "Demo reader" banner
+appears on the scan, review and pack-photo screens: a fixed sample reading must
+never look like a real one.
+
+### What was built
+
+- **Consultations (stage 1).** One doctor, one patient (name + phone), one
+  prescription of up to 10 pages. Doctor details come from the profile. Doctors see
+  only their own (closes open item 10). Existing pages are wrapped at startup;
+  confirmed ones become version 1 **with their old verification ID**, so a PDF
+  downloaded in Session 8 still verifies.
+- **One interaction check across all pages** (stage 2). Page-by-page would miss a
+  page-1 drug interacting with a page-2 drug.
+- **Finalise + immutable versions (stage 3, closes open item 11).** Patients and
+  pharmacies read only `consultation_versions` snapshots. An edit afterwards sets
+  `revising`; nobody sees it until it is finalised as version N, labelled "revised"
+  with a "what changed" note. Re-addressing to another phone also waits for finalise.
+  Finalise refuses while a line is AMBIGUOUS, and asks for explicit acknowledgement
+  while any are illegible or unmatched.
+- **Add / strike lines.** A missed line is a `missed` correction, a struck one
+  `hallucinated`; struck lines stay visible to the doctor and can be restored.
+- **Diagnosis.** `PageRead.diagnosis`, verbatim, prompt **v2** ("never infer it from
+  the medicines"). Doctor-editable with visibility: patient only (default), patient
+  and pharmacy, or hidden. Edits are page-level corrections.
+- **Sharing by OTP (stage 5).** 6 digits, HMAC-stored, redeem within 5 min, single
+  use, one prescription, one pharmacy, 15-minute read-only window. Wrong codes all
+  get one answer; 5 failures lock the pharmacy account. A new code cancels the
+  unused old one. The patient sees "Shared with X until 4:32 PM" and can end it.
+- **Pack checks (stage 6).** QR (camera via `BarcodeDetector`, or a handheld
+  scanner), photo (`vlm/pack_reader.py`, mock until the key exists), or typed.
+  `dispense/compare.py` compares **composition and strength**: match / substitute /
+  strength-or-form mismatch (chemist must confirm) / wrong medicine (blocked) /
+  could not verify (blocked). Expired packs are blocked. "Do not substitute" blocks
+  other brands.
+- **Expiry (stage 7).** Grant status is computed from timestamps on every request,
+  so there is no background job to miss; an ended grant is `410` everywhere and the
+  pharmacy screen drops the prescription from memory. What remains is
+  `dispensing_records`: no phone, image or diagnosis.
+- **QR on the PDF** → public `/check/<id>`: genuine?, doctor, registration no.,
+  current or superseded. Never the patient or the medicines.
+- **Pharmacy app** built inside `web_app` (`/pharmacy`), reusing the session cookie.
+  `pharmacy_dashboard/` is superseded and can be deleted.
+
+Workflow §10's open questions each got a default, recorded there.
+
+### Bugs found while building
+
+- **A corrected medicine name kept the OLD ingredients.** The corrections route
+  stored the new brand and left the composition beside it, so the interaction check
+  kept screening the drug the model had misread. Brand corrections now go back
+  through S3 (`pipeline.reresolve`).
+- **A revision un-dispensed everything.** Dispensing was tracked per version index,
+  so version 2 showed every pack as outstanding, inviting a second hand-over. It
+  now carries across versions by what the medicine is (ingredients + brand).
+- **The stored-XSS hole from `docs/UPDATES_SINCE_LOGIN.md` §6 was still open**, and
+  this session widened it: pharmacies now load prescription images too. Fixed before
+  pushing. The stored extension comes from the image's real format (Pillow), never
+  the filename, so `rx.html`, SVG and `x./../../escaped` are all refused or
+  renamed. Images are served with a fixed `image/*` type, `nosniff` and a sandboxing
+  CSP. Every response now carries `X-Frame-Options: DENY`, `nosniff`,
+  `Referrer-Policy` and a CSP (self + Google Fonts, no inline script). The browser
+  run produced no CSP violations.
+- **A test expectation was wrong, not the code:** "Zofer" with no strength on the
+  pack, against a prescribed "Zofer 4mg", correctly abstains as could-not-verify.
+
+### Verified (mock reader + test fixture)
+
+This checkout has neither the medicine CSVs (gitignored) nor the eval images, so
+checks ran against `ml_pipeline/tests/fixtures/india`: 15 brands, every row marked
+`TEST FIXTURE`, selected with `PRESCRIPTAI_DATA_DIR`.
+
+- `ml_pipeline/tests/test_dispense.py`: **23/23**.
+- API, **98/98** (scratch script, live server, throwaway DB): ownership 404s, CSRF,
+  multi-page severe interaction, re-resolution, finalise rules, v1→v2 revision
+  invisible until finalised, re-addressing, OTP single use / cancel / lapse / lock,
+  expiry and revoke as 410 on every route, minimal records, verify endpoint
+  superseded flag, legacy upload path.
+- Browser, **38/38** (Playwright Chromium; patient and verify page at 390 px): full
+  doctor → patient → pharmacy flow, no horizontal scroll, no unexpected console
+  errors.
+- The PDF was rendered and inspected: QR, version, diagnosis, struck line absent.
+
+**Not verified:** the Claude pack reader against the live API (no key in this
+session), the real 239k-brand data (absent here), and Docker (daemon not running).
+
+### Open items added
+
+14. **Live-verify the pack reader** once the key is in: a photo of a real strip.
+15. **Patient medicine information** ("what it is used for") has no content source.
+16. **No SMS fallback for patients without a smartphone** (Workflow §10 Q7).
 
 ---
 

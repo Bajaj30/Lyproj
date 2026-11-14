@@ -54,6 +54,15 @@ class Settings:
     # Must be true anywhere served over HTTPS; false only for http://localhost.
     COOKIE_SECURE: bool = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 
+    # Pharmacy sharing (Workflow.md stage 5). A patient's OTP must be redeemed
+    # within SHARE_REDEEM_MINUTES; once redeemed the pharmacy has read-only access
+    # to that one prescription for SHARE_WINDOW_MINUTES.
+    SHARE_REDEEM_MINUTES: int = int(os.getenv("SHARE_REDEEM_MINUTES", "5"))
+    SHARE_WINDOW_MINUTES: int = int(os.getenv("SHARE_WINDOW_MINUTES", "15"))
+
+    # Where the site is reachable; the QR on a prescription PDF points here.
+    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+
     # Redis (scaffolded, not active in prototype)
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 

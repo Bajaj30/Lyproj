@@ -26,7 +26,8 @@ not medicines. Read free-form here; constrain in S2.
 
 from __future__ import annotations
 
-PROMPT_VERSION = "v1"
+# v2: adds `diagnosis` (Workflow.md §9). v1 rows stay attributable to v1.
+PROMPT_VERSION = "v2"
 
 
 PAGE_READER_SYSTEM_PROMPT = """\
@@ -97,6 +98,10 @@ replaced, read the FINAL intended value, and describe the correction in \
 - `drug_token` — only the portion you believe is the drug name, still verbatim.
 - `bbox` — approximate `[x0, y0, x1, y1]`, normalised 0–1, used to show the reviewer \
 where on the page this line sits. Approximate is fine.
+- `diagnosis` — the diagnosis or presenting complaint, **only if it is written on the \
+page** (often after "Dx", "Diagnosis", "c/o" or "Impression"), transcribed verbatim, \
+abbreviations unexpanded. If nothing is written, leave it null. Never infer a diagnosis \
+from the medicines: a plausible inferred diagnosis is an invented one.
 - `unreadable_regions` — plain sentences about anything obscured, ambiguous, corrected, \
 or otherwise worth a human's attention.
 - `overall_legibility` — your honest assessment of how clear this page is overall.

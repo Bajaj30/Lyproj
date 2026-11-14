@@ -77,6 +77,12 @@ class PageRead(BaseModel):
     patient_name: Optional[str] = None
     prescriber_name: Optional[str] = None
     date: Optional[str] = None
+    diagnosis: Optional[str] = Field(
+        default=None,
+        description="Diagnosis or presenting complaint, verbatim, only if written "
+        "(e.g. 'AGE', 'URTI', 'c/o fever x 3 days'). None when absent — never inferred "
+        "from the medicines.",
+    )
     medicines: List[MedicineLine] = Field(default_factory=list)
     unreadable_regions: List[str] = Field(
         default_factory=list,

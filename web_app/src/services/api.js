@@ -74,20 +74,42 @@ export const submitCorrection = async (prescriptionId, correction) => {
   return data
 }
 
-/** Confirm a page. An unchanged page is a fully labelled page — the majority class. */
-export const markReviewed = async (prescriptionId) => {
-  // The reviewer is whoever is signed in — the backend takes it from the session.
-  const { data } = await api.post(`/api/prescriptions/${prescriptionId}/review`)
-  return data
-}
+// ── consultations (Workflow stages 1–3) ──────────────────────────────────────
+// A consultation is one doctor, one patient, one prescription of N pages. Every
+// mutating call returns the whole consultation, so the screen re-renders from
+// what the server now holds rather than from a local guess.
 
-/** Address a prescription to a patient's phone (empty string stops sharing). */
-export const setPatientPhone = async (prescriptionId, phone) => {
-  const { data } = await api.put(`/api/prescriptions/${prescriptionId}/patient`, { phone })
-  return data
-}
+const data = async (p) => (await p).data
 
-// ── patient app (Workflow stage 4) ───────────────────────────────────────────
+export const createConsultation = (body) => data(api.post('/api/consultations', body))
+export const getConsultations = () => data(api.get('/api/consultations'))
+export const getConsultation = (id) => data(api.get(`/api/consultations/${id}`))
+export const updateConsultation = (id, body) => data(api.patch(`/api/consultations/${id}`, body))
+
+export const uploadPage = (consultationId, file) => {
+  const form = new FormData()
+  form.append('image', file)
+  return data(api.post(`/api/consultations/${consultationId}/pages`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  }))
+}
+export const deletePage = (consultationId, pageId) =>
+  data(api.delete(`/api/consultations/${consultationId}/pages/${pageId}`))
+export const addMedicine = (consultationId, body) =>
+  data(api.post(`/api/consultations/${consultationId}/medicines`, body))
+export const removeMedicine = (pageId, index, note) =>
+  data(api.post(`/api/prescriptions/${pageId}/medicines/${index}/remove`, { note: note || null }))
+export const restoreMedicine = (pageId, index) =>
+  data(api.post(`/api/prescriptions/${pageId}/medicines/${index}/restore`))
+export const finaliseConsultation = (id, { acknowledgeUnresolved = false, changeNote = '' } = {}) =>
+  data(api.post(`/api/consultations/${id}/finalise`, {
+    acknowledge_unresolved: acknowledgeUnresolved, change_note: changeNote || null,
+  }))
+
+/** Public: what the QR on a prescription PDF opens. */
+export const verifyDocument = (vid) => data(api.get(`/api/verify/${encodeURIComponent(vid)}`))
+
+// ── patient app (Workflow stages 4–5) ────────────────────────────────────────
 
 export const getMyPrescriptions = async () => {
   const { data } = await api.get('/api/patient/prescriptions')
@@ -99,7 +121,33 @@ export const getMyPrescription = async (id) => {
   return data
 }
 
-export const myPrescriptionImageUrl = (id) => `${API_BASE}/api/patient/prescriptions/${id}/image`
+export const myPrescriptionImageUrl = (id, page = 1) =>
+  `${API_BASE}/api/patient/prescriptions/${id}/pages/${page}/image`
+
+/** A 6-digit code for ONE pharmacy, for this prescription only. Shown once. */
+export const shareWithPharmacy = (id) => data(api.post(`/api/patient/prescriptions/${id}/share`))
+export const revokeShare = (grantId) => data(api.post(`/api/patient/grants/${grantId}/revoke`))
+
+// ── pharmacy app (Workflow stages 5–7) ───────────────────────────────────────
+
+export const redeemCode = (otp) => data(api.post('/api/pharmacy/redeem', { otp }))
+export const getGrants = () => data(api.get('/api/pharmacy/grants'))
+export const getGrant = (id) => data(api.get(`/api/pharmacy/grants/${id}`))
+export const grantImageUrl = (id, page) => `${API_BASE}/api/pharmacy/grants/${id}/pages/${page}/image`
+
+/** method: 'qr' | 'photo' | 'manual'. `fields` are the form fields; `photo` a File. */
+export const checkPack = (grantId, method, fields = {}, photo = null) => {
+  const form = new FormData()
+  form.append('method', method)
+  Object.entries(fields).forEach(([k, v]) => { if (v != null && String(v).trim()) form.append(k, v) })
+  if (photo) form.append('image', photo)
+  return data(api.post(`/api/pharmacy/grants/${grantId}/checks`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  }))
+}
+export const confirmCheck = (grantId, checkId) =>
+  data(api.post(`/api/pharmacy/grants/${grantId}/checks/${checkId}/confirm`))
+export const getDispensingRecords = () => data(api.get('/api/pharmacy/records'))
 
 /**
  * Fetch the PDF and hand it to the browser as a download. Fetched rather than

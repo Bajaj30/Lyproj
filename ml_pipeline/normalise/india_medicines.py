@@ -47,6 +47,7 @@ from __future__ import annotations
 import re
 import sys
 from dataclasses import dataclass, field
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -57,7 +58,10 @@ from normalise.drug_names import normalise_generic  # noqa: E402
 from schemas import VerificationTier  # noqa: E402
 
 _ML_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = _ML_DIR / "data" / "india"
+# PRESCRIPTAI_DATA_DIR points the loader at another copy of the two CSVs — used
+# by the test fixture in tests/fixtures/india, and by deployments that mount the
+# data rather than bake it into the image.
+DATA_DIR = Path(os.environ.get("PRESCRIPTAI_DATA_DIR") or (_ML_DIR / "data" / "india"))
 MASTER_CSV = DATA_DIR / "indian_medicines_master.csv"
 NLEM_FORMULATIONS_CSV = DATA_DIR / "nlem2022_formulations.csv"
 
@@ -255,6 +259,18 @@ class IndiaMedicines:
         if len({h.composition for h in hits}) > 1:
             return None  # ambiguous without the strength — caller must ask
         return hits[0]
+
+    def exact(self, brand: Optional[str]) -> Optional[BrandInfo]:
+        """Full-name hit only. Used where the STRENGTH matters (dispensing):
+        a base-name hit picks one strength variant arbitrarily, so its strength
+        must not be read as the prescribed one."""
+        return self._by_full.get(match_key(brand)) if brand else None
+
+    def variants(self, brand: Optional[str]) -> List[str]:
+        """Every full brand name sharing this base ("Zofer" -> Zofer 4mg, Zofer 8mg)."""
+        if not brand:
+            return []
+        return sorted({h.brand for h in self._by_base.get(match_key(base_brand(brand)), [])})
 
     def ingredient(self, name: Optional[str]) -> Optional[str]:
         """Canonical ingredient name, for a prescription written in generics."""

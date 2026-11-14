@@ -62,6 +62,21 @@ def require(name: str) -> str:
     return val
 
 
+# Values that mean "not filled in yet" — the placeholder in .env.example included.
+_PLACEHOLDER_KEYS = {"", "sk-ant-...", "sk-ant-xxx", "your-key-here", "changeme"}
+
+
+def api_key_configured() -> bool:
+    """True when ANTHROPIC_API_KEY holds something that could be a real key.
+
+    Deliberately shallow: it does not call the API. A wrong key fails loudly on
+    the first read (a 502 naming the reader), which is the honest failure.
+    """
+    load_env()
+    key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    return key not in _PLACEHOLDER_KEYS and "..." not in key and len(key) >= 20
+
+
 def has(name: str) -> bool:
     load_env()
     return bool(os.environ.get(name))

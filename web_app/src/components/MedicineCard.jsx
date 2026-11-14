@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, HelpCircle, EyeOff, SearchX, ShieldCheck, ShieldAlert, Shield } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, HelpCircle, EyeOff, SearchX, ShieldCheck, ShieldAlert, Shield, Trash2, Undo2, UserPen } from 'lucide-react'
 
 /**
  * One medicine, showing BOTH facts the reviewer needs (ARCHITECTURE_V2 §5/S1):
@@ -31,22 +31,48 @@ const VERIFY = {
   unknown:    { label: 'Unknown drug',   pill: 'bg-ink-200 text-ink-700',   Icon: ShieldAlert },
 }
 
-export default function MedicineCard({ medicine, imageSrc, onPickCandidate, onCorrect }) {
+export default function MedicineCard({ medicine, imageSrc, onPickCandidate, onCorrect, onRemove, onRestore }) {
   const o = OUTCOME[medicine.outcome] ?? OUTCOME.illegible
   const v = VERIFY[medicine.verification] ?? VERIFY.unknown
   const { Icon } = o
   const VIcon = v.Icon
+
+  // A struck line stays on screen, greyed, so the doctor can see what the
+  // reader produced and undo the removal. It is excluded from the safety check
+  // and never reaches the patient.
+  if (medicine.removed) {
+    return (
+      <div className="flex flex-wrap items-center gap-3 rounded-xl border border-dashed border-ink-300 bg-white/60 px-4 py-3 text-sm text-ink-500">
+        <Trash2 className="h-4 w-4" aria-hidden />
+        <span className="line-through">{medicine.brand ?? medicine.generic ?? `“${medicine.raw_reading}”`}</span>
+        <span>removed from the prescription</span>
+        {onRestore && (
+          <button type="button" onClick={() => onRestore(medicine)} className="ml-auto inline-flex items-center gap-1 font-medium text-care-800 hover:underline">
+            <Undo2 className="h-4 w-4" /> Restore
+          </button>
+        )}
+      </div>
+    )
+  }
+
+  // A prescription written in generics has no brand; name it by its generic.
+  const name = medicine.brand
+    ?? (['confirmed', 'probable'].includes(medicine.outcome) && medicine.generic)
+    ?? (medicine.outcome === 'unmatched' && medicine.raw_reading)
 
   return (
     <div className={`rounded-xl border p-4 shadow-clinical ${o.cls}`}>
       <div className="flex flex-wrap items-center gap-2">
         <Icon className="h-5 w-5 shrink-0" aria-hidden />
         <span className="font-display text-xl font-semibold text-ink-900">
-          {medicine.brand
-            ?? (medicine.outcome === 'unmatched' && medicine.raw_reading)
-            ?? <em className="font-normal text-ink-500">not identified</em>}
+          {name || <em className="font-normal text-ink-500">not identified</em>}
         </span>
         <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${o.pill}`}>{o.label}</span>
+        {medicine.doctor_entered && (
+          <span className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-0.5 text-xs font-medium text-ink-700 ring-1 ring-ink-200">
+            <UserPen className="h-3 w-3" aria-hidden />Entered by you
+          </span>
+        )}
         <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${v.pill}`}>
           <VIcon className="h-3 w-3" aria-hidden />{v.label}
         </span>
@@ -55,21 +81,24 @@ export default function MedicineCard({ medicine, imageSrc, onPickCandidate, onCo
         )}
       </div>
 
-      {medicine.generic && (
+      {medicine.generic && medicine.generic !== name && (
         <p className="mt-1 text-sm text-ink-700">{medicine.generic}</p>
       )}
 
       {/* What the model actually saw. Never dropped — losing it makes every
           later disagreement impossible to adjudicate. */}
-      <p className="mt-2 font-mono text-xs text-ink-500">
-        read as: “{medicine.raw_reading}”
-        {medicine.matched_via && ` · matched via alternative “${medicine.matched_via}”`}
-      </p>
+      {medicine.raw_reading && (
+        <p className="mt-2 font-mono text-xs text-ink-500">
+          read as: “{medicine.raw_reading}”
+          {medicine.matched_via && ` · matched via alternative “${medicine.matched_via}”`}
+        </p>
+      )}
 
       <dl className="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-sm text-ink-700">
         {medicine.dosage && <div><dt className="inline text-ink-500">Dose </dt><dd className="inline font-medium">{medicine.dosage}</dd></div>}
         {medicine.frequency && <div><dt className="inline text-ink-500">Freq </dt><dd className="inline font-medium">{medicine.frequency}</dd></div>}
         {medicine.duration && <div><dt className="inline text-ink-500">Duration </dt><dd className="inline font-medium">{medicine.duration}</dd></div>}
+        {medicine.instructions && <div><dt className="inline text-ink-500">Note </dt><dd className="inline font-medium">{medicine.instructions}</dd></div>}
       </dl>
 
       {/* Unverified components are NAMED, never silently dropped — the reviewer
@@ -136,14 +165,21 @@ export default function MedicineCard({ medicine, imageSrc, onPickCandidate, onCo
         <CropPreview src={imageSrc} bbox={medicine.bbox} />
       )}
 
-      {onCorrect && (
-        <button
-          type="button"
-          onClick={() => onCorrect(medicine)}
-          className="mt-3 text-sm font-medium text-care-800 underline underline-offset-2 hover:text-care-900"
-        >
-          Correct this
-        </button>
+      {(onCorrect || onRemove) && (
+        <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2">
+          {onCorrect && (
+            <button type="button" onClick={() => onCorrect(medicine)}
+                    className="text-sm font-medium text-care-800 underline underline-offset-2 hover:text-care-900">
+              Correct this
+            </button>
+          )}
+          {onRemove && (
+            <button type="button" onClick={() => onRemove(medicine)}
+                    className="inline-flex items-center gap-1 text-sm font-medium text-ink-600 hover:text-vital-700">
+              <Trash2 className="h-3.5 w-3.5" /> Not on the page — remove
+            </button>
+          )}
+        </div>
       )}
     </div>
   )

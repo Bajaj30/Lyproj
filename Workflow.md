@@ -324,25 +324,35 @@ New entities are marked **new**. Existing tables are in `backend/models.py`.
 | Upload → AI transcription (S0–S4) | ✅ built |
 | Doctor review screen, corrections log, confirm | ✅ built |
 | Interaction check with citations and `skipped` | ✅ built |
-| Doctor / patient details on a session | ⬜ new: today a prescription has only the patient/prescriber name *read from the page* |
-| Multi-page session with one interaction check across all pages | ⬜ new: today each upload is a separate prescription |
-| Finalise + versioning | ⬜ new: today there is "mark reviewed" only |
-| Diagnosis extraction | ⬜ new: `PageRead` has no diagnosis field. Needs a schema + prompt change (bump `PROMPT_VERSION`). |
+| Doctor / patient details on a session | ✅ built (Session 9): `consultations`; doctor details from the profile |
+| Multi-page session with one interaction check across all pages | ✅ built (Session 9) |
+| Finalise + versioning | ✅ built (Session 9): immutable `consultation_versions`; edits after finalising become a labelled revision |
+| Diagnosis extraction | ✅ built (Session 9): `PageRead.diagnosis`, prompt v2; doctor-editable with visibility (Q6) |
 | Patient-friendly medicine information | ⬜ new: needs a content source; the brand dataset gives composition only |
 | Accounts, phone / email verification | ✅ built: see README §6a |
-| Patient app (prescriptions, sharing) | 🟡 partly built: inbox and prescription view (stage 4). Sharing by OTP (stage 5) is new. Until stage 1 exists the doctor enters the patient's phone on the review screen. |
-| PDF download | ✅ built: doctor details, medicines, interactions with what was not checked, the original page, a verification ID and the AI notice. No QR yet: there is no verification endpoint for one to point at. |
-| OTP sharing, 15-min access window, revocation | ⬜ new |
-| Pharmacy app on the real API | ⬜ new: `pharmacy_dashboard/` is static demo data today |
-| Pack verification by QR | ⬜ new |
-| Pack verification by photo | 🟡 partly reusable: S1 + S2/S3 can read and match a label, but needs a pack-label prompt |
+| Patient app (prescriptions, sharing) | ✅ built: inbox, prescription view, sharing by OTP, revoke, access history, dispensing results |
+| PDF download | ✅ built: doctor details, diagnosis, medicines, interactions with what was not checked, every original page, a verification ID, a QR to the public `/check/<id>` page and the AI notice |
+| OTP sharing, 15-min access window, revocation | ✅ built (Session 9) |
+| Pharmacy app on the real API | ✅ built (Session 9) inside `web_app` (`/pharmacy`); `pharmacy_dashboard/` is superseded |
+| Pack verification by QR | ✅ built (Session 9): JSON, key-value, GS1 and text payloads; link-only QRs report "could not verify" |
+| Pack verification by photo | ✅ built (Session 9): `vlm/pack_reader.py`; mock until an API key is set |
 | Authentication for doctors, patients and pharmacies | ✅ built: register by email / phone / username, login, logout, reset + recovery codes, sessions, TOTP MFA, verification. Prescription routes are doctor-only. (README §6a) |
 
 ---
 
 ## 10. Open questions
 
-Decisions still needed before building:
+Decisions still needed. Session 9 built a default for each, marked **Default:**; they are
+settings or single code paths, so changing one is small.
+
+- Q1 **Default:** only the pharmacy checks packs, during the access window; the patient sees the results.
+- Q2 **Default:** 15 minutes (`SHARE_WINDOW_MINUTES`), one value for every pharmacy; no extension, the patient issues a new code.
+- Q3 **Default:** `dispensing_records` keeps date, prescription ID, prescriber + reg. no., brand, composition, strength, batch, expiry, quantity, result. Confirm against the drug-schedule rules.
+- Q4 **Default:** substitution allowed unless the doctor ticks "do not substitute" for the prescription.
+- Q5 **Default:** registration number optional and self-declared; the verify page says it is unchecked.
+- Q6 **Default:** patient sees the diagnosis, pharmacy does not; the doctor can change this per prescription or hide it.
+- Q7–Q8: not built. Q9: link-only QRs report "could not verify". Q10: a revision is labelled for the patient; dispensing carries across versions by medicine.
+
 
 1. **Who performs the dispensing check?** The workflow reads as the pharmacy app
    scanning during the access window, with the patient seeing the result. Should the

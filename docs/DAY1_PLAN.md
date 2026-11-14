@@ -1,5 +1,8 @@
 # Day 1 — Working Pipeline: Work Split
 
+> *Historical: the Day 1 plan, kept as written. All three tracks are done; current
+> status is in [`claude.md`](../claude.md).*
+
 **Goal:** an end-to-end working pipeline by end of day.
 **Team:** 3 people, 3 parallel tracks.
 **Reference:** [`ARCHITECTURE_V2.md`](./ARCHITECTURE_V2.md) — the *what* and *why*. This

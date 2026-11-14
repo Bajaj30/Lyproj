@@ -1,16 +1,27 @@
-# React + Vite
+# PrescriptAI web app
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React 19 + Vite + Tailwind. One app for all three roles: doctor, patient and
+pharmacy. The project overview is the [root README](../README.md).
 
-Currently, two official plugins are available:
+```bash
+npm install
+npm run dev        # http://localhost:5173, talks to the API on :8000
+npm run build      # dist/; in Docker FastAPI serves it with VITE_API_URL=""
+npm run lint
+```
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+| Role | Routes |
+|---|---|
+| Doctor | `/upload` (new consultation), `/consultations/:id` (review, finalise, versions), `/history`, `/dashboard` |
+| Patient | `/patient`, `/patient/prescriptions/:id` (PDF, share with a pharmacy, revoke) |
+| Pharmacy | `/pharmacy` (enter code), `/pharmacy/grants/:id` (check packs), `/pharmacy/records` |
+| Public | `/`, `/interactions`, `/check/:id` (verify a prescription PDF) |
 
-## React Compiler
+Rules the screens keep:
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+- **The server enforces access; the UI only reflects it.** Route guards
+  (`components/auth/RequireAuth.jsx`) avoid rendering screens that would 403.
+- **No fabricated results.** A failed request shows a failure. The mock reader is
+  labelled "Demo reader" (`components/DemoReaderBanner.jsx`).
+- **Every unsafe request sends `X-Requested-With: PrescriptAI`** (`services/api.js`).
+  The session is an HttpOnly cookie the page cannot read.

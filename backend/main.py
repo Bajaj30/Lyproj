@@ -17,7 +17,13 @@ Two behaviours this API is deliberately built around:
     6" and "we checked 6" are very different claims to put in front of a
     clinician.
 
-Set READER=mock to run the whole product with no API key and no cost.
+READER selects the page reader: "auto" (the default) uses Claude when
+ANTHROPIC_API_KEY is set in .env and the mock reader otherwise; "mock" and
+"claude" force one. The mock runs the whole product with no key and no cost.
+
+Routers: auth (auth/), consultations + pages + finalise (consultations.py),
+patient (patient.py), pharmacy (pharmacy.py). This file keeps the page-level
+routes, stats, the corrections corpus, image serving and /api/verify.
 
 Access (backend/auth/): prescription routes and uploaded images are for signed-in
 DOCTORS only — the images are patient data. The manual interaction lookup and
@@ -26,12 +32,9 @@ DOCTORS only — the images are patient data. The manual interaction lookup and
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import sys
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -39,6 +42,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Uploa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -49,26 +53,32 @@ from env import load_env  # noqa: E402
 
 load_env()
 
-from auth import Role, User, current_user, require_roles  # noqa: E402
+import pipeline  # noqa: E402
+from auth import Role, User, require_roles  # noqa: E402
 from auth import router as auth_router  # noqa: E402
-from auth.routes import _event, norm_phone  # noqa: E402
-from patient import router as patient_router  # noqa: E402
-from config.database import Base, engine, get_db  # noqa: E402
+from auth.models import aware  # noqa: E402
+from auth.routes import _event, _ip, _throttle  # noqa: E402
+from config.database import Base, SessionLocal, engine, get_db  # noqa: E402
 from config.settings import settings  # noqa: E402
-from drug_interaction.interaction_inference import InteractionChecker  # noqa: E402
-from ingest.normalise import normalise  # noqa: E402
-from models import Correction, CorrectionType, InteractionRun, Prescription  # noqa: E402
-from vlm.page_reader import CachedPageReader, build_reader  # noqa: E402
+from consultations import (  # noqa: E402
+    build_snapshot, doctor_details, ingest_page, mark_changed, owned_page, recompute,
+)
+from consultations import router as consultations_router  # noqa: E402
+from env import api_key_configured  # noqa: E402
+from models import (  # noqa: E402
+    Consultation, ConsultationStatus, ConsultationVersion, Correction, CorrectionType,
+    Prescription,
+)
+from patient import router as patient_router  # noqa: E402
+from pharmacy import router as pharmacy_router  # noqa: E402
+from views import (  # noqa: E402
+    UPLOAD_DIR, InteractionOutcome, image_response, PrescriptionOut, legacy_verification_id, page_out,
+)
 from vlm.prompts import PROMPT_VERSION  # noqa: E402
 from vlm.spend import get_guard  # noqa: E402
-from vlm.vocab import load_config, resolve_page  # noqa: E402
+from vlm.vocab import load_config  # noqa: E402
 
-UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-# "mock" runs the entire product with no key and no cost — that is how Track C
-# was built before the reader existed, and how the UI is developed cheaply.
-READER_KIND = os.environ.get("READER", "claude")
 
 app = FastAPI(title="PrescriptAI API", version="2.0.0")
 
@@ -88,6 +98,31 @@ async def csrf_guard(request: Request, call_next):
     return await call_next(request)
 
 
+# Security headers on every response (docs/UPDATES_SINCE_LOGIN.md §6). The CSP
+# allows only this origin plus Google Fonts (index.html); inline styles are
+# needed by React style props. No inline or third-party script runs.
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Permissions-Policy": "camera=(self), microphone=(), geolocation=()",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; connect-src 'self'; media-src 'self' blob:; "
+        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    ),
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for k, v in SECURITY_HEADERS.items():
+        response.headers.setdefault(k, v)
+    return response
+
+
 # Added after the CSRF guard so it wraps it: a refused request still carries
 # the CORS headers, and the browser shows the real error instead of a CORS one.
 app.add_middleware(
@@ -96,12 +131,11 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],  # the PDF download's filename
 )
 app.include_router(auth_router)
+app.include_router(consultations_router)
 app.include_router(patient_router)
+app.include_router(pharmacy_router)
 
 doctor_only = require_roles(Role.DOCTOR)
-
-_reader = None
-_checker = None
 
 
 def _add_missing_columns() -> None:
@@ -123,82 +157,53 @@ def _add_missing_columns() -> None:
                     print(f"[DB] added column {table.name}.{col.name}", flush=True)
 
 
+def _backfill_consultations() -> None:
+    """Pages written before consultations existed each become a one-page
+    consultation. A page that was already confirmed becomes version 1 with the
+    verification ID it was issued under, so a PDF downloaded then still verifies."""
+    with SessionLocal() as db:
+        rows = db.query(Prescription).filter(Prescription.consultation_id.is_(None)).all()
+        for rx in rows:
+            owner = db.get(User, rx.reviewed_by) if rx.reviewed_by else None
+            if owner and owner.role != Role.DOCTOR:
+                owner = None
+            page = json.loads(rx.page_read_json)
+            c = Consultation(doctor_id=owner.id if owner else None, patient_name=rx.patient_name,
+                             patient_phone=rx.patient_phone, legacy=True,
+                             created_at=rx.created_at, diagnosis=page.get("diagnosis"))
+            db.add(c)
+            db.flush()
+            rx.consultation_id, rx.page_no = c.id, 1
+            db.flush()
+            db.refresh(c)
+            result = recompute(db, c)
+            if rx.reviewed_at and rx.patient_phone:
+                at = aware(rx.reviewed_at)
+                snap = build_snapshot(c, doctor_details(owner, None), result, 1, at)
+                db.add(ConsultationVersion(
+                    consultation_id=c.id, version=1, finalised_at=at, finalised_by=rx.reviewed_by,
+                    patient_phone=rx.patient_phone, change_note=None,
+                    verification_id=legacy_verification_id(rx.id, rx.reviewed_at),
+                    snapshot_json=json.dumps(snap)))
+                c.current_version, c.finalised_at, c.status = 1, at, ConsultationStatus.FINALISED
+        if rows:
+            db.commit()
+            print(f"[DB] wrapped {len(rows)} page(s) from before consultations", flush=True)
+
+
 @app.on_event("startup")
 def _startup() -> None:
-    global _reader, _checker
     Base.metadata.create_all(bind=engine)
     _add_missing_columns()
-    print(f"[API] reader={READER_KIND} prompt={PROMPT_VERSION}", flush=True)
-    _reader = build_reader(READER_KIND)
-    _checker = InteractionChecker()
+    pipeline.init()
+    print(f"[API] reader={pipeline.reader_kind} (READER={pipeline.READER_SETTING}) "
+          f"prompt={PROMPT_VERSION}", flush=True)
+    _backfill_consultations()
     cfg = load_config()
     print(f"[API] vocabulary region={cfg.region} nlem={cfg.nlem_enabled}", flush=True)
     if "change-in-production" in settings.SECRET_KEY:
         print("[API] WARNING: SECRET_KEY is the built-in default. Set it in .env "
               "before anyone but a developer uses this.", flush=True)
-
-
-# ─── response models ─────────────────────────────────────────────────────────
-
-
-class MedicineOut(BaseModel):
-    index: int
-    brand: Optional[str] = None
-    generic: Optional[str] = None
-    ingredients: List[str] = []
-    verified_ingredients: List[str] = []
-    unverified_ingredients: List[str] = []
-    verification: str
-    outcome: str
-    confidence: float
-    match_score: Optional[float] = None
-    raw_reading: str
-    matched_via: Optional[str] = None
-    candidates: List[str] = []
-    dosage: Optional[str] = None
-    frequency: Optional[str] = None
-    duration: Optional[str] = None
-    instructions: Optional[str] = None
-    bbox: Optional[List[float]] = None
-    needs_hard_confirmation: bool
-
-
-class InteractionOut(BaseModel):
-    drug_a: str
-    drug_b: str
-    severity: str
-    severity_color: str
-    effect: str = ""
-    mechanism: str = ""
-    safer_alternative: str = ""
-    reference: str = ""
-
-
-class InteractionOutcome(BaseModel):
-    interactions: List[InteractionOut] = []
-    total_count: int = 0
-    overall_risk: str = "none"
-    medicines_checked: List[str] = []
-    skipped: List[str] = Field(
-        default=[], description="Excluded from the safety check, with reasons. Never hidden."
-    )
-
-
-class PrescriptionOut(BaseModel):
-    id: str
-    created_at: str
-    image_url: str
-    document_type: str
-    overall_legibility: float
-    patient_name: Optional[str] = None
-    prescriber_name: Optional[str] = None
-    date: Optional[str] = None
-    unreadable_regions: List[str] = []
-    medicines: List[MedicineOut] = []
-    interactions: InteractionOutcome
-    reviewed: bool = False
-    patient_phone: Optional[str] = None
-    disclaimer: str
 
 
 class CorrectionIn(BaseModel):
@@ -210,50 +215,7 @@ class CorrectionIn(BaseModel):
     corrected_by: str = Field("doctor", description="Ignored — taken from the signed-in user")
 
 
-DISCLAIMER = (
-    "AI-extracted. Verify against the original prescription before dispensing — "
-    "this can be wrong. Only ingredients on the NLEM 2022 essential-medicines "
-    "list are checked for interactions; anything else is listed under 'skipped'."
-)
-
-
-# ─── helpers ─────────────────────────────────────────────────────────────────
-
-
-def _med_out(i: int, m) -> MedicineOut:
-    return MedicineOut(
-        index=i, brand=m.brand, generic=m.generic, ingredients=m.ingredients,
-        verified_ingredients=m.verified_ingredients,
-        unverified_ingredients=m.unverified_ingredients,
-        verification=m.verification.value, outcome=m.outcome.value,
-        confidence=m.confidence, match_score=m.match_score,
-        raw_reading=m.raw_reading, matched_via=m.matched_via,
-        candidates=m.candidates, dosage=m.dosage, frequency=m.frequency,
-        duration=m.duration, instructions=m.instructions, bbox=m.bbox,
-        needs_hard_confirmation=m.needs_hard_confirmation,
-    )
-
-
-def _to_out(rx: Prescription) -> PrescriptionOut:
-    page = json.loads(rx.page_read_json)
-    meds = json.loads(rx.resolved_json)
-    run = rx.interaction_runs[-1] if rx.interaction_runs else None
-    inter = json.loads(run.result_json) if run else {}
-    return PrescriptionOut(
-        id=rx.id,
-        created_at=rx.created_at.isoformat() if rx.created_at else "",
-        image_url=f"/uploads/{Path(rx.image_path).name}",
-        document_type=rx.document_type or "prescription",
-        overall_legibility=rx.overall_legibility or 0.0,
-        patient_name=rx.patient_name, prescriber_name=rx.prescriber_name,
-        date=rx.prescribed_date,
-        unreadable_regions=page.get("unreadable_regions", []),
-        medicines=[MedicineOut(**m) for m in meds],
-        interactions=InteractionOutcome(**inter) if inter else InteractionOutcome(),
-        reviewed=rx.reviewed_at is not None,
-        patient_phone=rx.patient_phone,
-        disclaimer=DISCLAIMER,
-    )
+EDITABLE_FIELDS = {"brand", "dosage", "frequency", "duration", "instructions"}
 
 
 # ─── routes ──────────────────────────────────────────────────────────────────
@@ -263,7 +225,11 @@ def _to_out(rx: Prescription) -> PrescriptionOut:
 def health():
     guard = get_guard()
     return {
-        "status": "healthy", "version": "2.0.0", "reader": READER_KIND,
+        "status": "healthy", "version": "2.0.0", "reader": pipeline.reader_kind,
+        # The UI shows a "demo reader" banner while this is true. Adding
+        # ANTHROPIC_API_KEY to .env and restarting turns it off.
+        "reader_is_mock": pipeline.is_mock(),
+        "api_key_configured": api_key_configured(),
         "prompt_version": PROMPT_VERSION,
         "spend_usd": round(guard.total_usd(), 4),
         "spend_cap_usd": guard.cap_usd,
@@ -276,53 +242,26 @@ def health():
 
 @app.post("/api/prescriptions/upload", response_model=PrescriptionOut)
 async def upload_prescription(
-    image: UploadFile = File(...), db: Session = Depends(get_db),
+    request: Request, image: UploadFile = File(...), db: Session = Depends(get_db),
     user: User = Depends(doctor_only),
 ):
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise HTTPException(400, "File must be an image (jpg, png, ...)")
-
-    contents = await image.read()
-    ext = (image.filename or "x.jpg").rsplit(".", 1)[-1].lower()
-    img_id = str(uuid.uuid4())
-    img_path = UPLOAD_DIR / f"{img_id}.{ext}"
-    img_path.write_bytes(contents)
-
-    try:
-        norm = normalise(contents)                       # S0
-        page = _reader.read(norm)                        # S1
-    except Exception as exc:  # spend cap, auth, API failure
-        raise HTTPException(502, f"Reader failed: {exc}") from exc
-
-    meds = resolve_page(page)                            # S2 + S3
-    result = _checker.check(meds)                        # S4
-
-    inner = getattr(_reader, "inner", _reader)
-    cost = getattr(inner, "last_cost", None)
-
-    rx = Prescription(
-        id=img_id, image_path=str(img_path), image_sha256=norm.sha256,
-        model=_reader.model, prompt_version=PROMPT_VERSION,
-        effort=getattr(inner, "effort", None),
-        raw_response=json.dumps(getattr(inner, "last_raw_response", None)),
-        page_read_json=page.model_dump_json(),
-        resolved_json=json.dumps([_med_out(i, m).model_dump()
-                                  for i, m in enumerate(meds)]),
-        document_type=page.document_type,
-        overall_legibility=page.overall_legibility,
-        patient_name=page.patient_name, prescriber_name=page.prescriber_name,
-        prescribed_date=page.date,
-        cost_usd=cost.usd if cost else 0.0,
-        from_cache=isinstance(_reader, CachedPageReader) and cost is None,
-    )
-    db.add(rx)
-    db.add(InteractionRun(
-        prescription_id=rx.id, overall_risk=result["overall_risk"],
-        total_count=result["total_count"], result_json=json.dumps(result),
-    ))
+    """One page with no patient details yet. Kept for scripts and old clients:
+    it opens a consultation around the page, which the doctor completes on the
+    review screen (POST /api/consultations is the normal path)."""
+    profile = json.loads(user.profile_json or "{}")
+    c = Consultation(doctor_id=user.id, clinic_address=profile.get("clinic_address"))
+    db.add(c)
+    db.flush()
+    rx = await ingest_page(db, image, c)
+    _event(db, request, "page_uploaded", user.id, f"{c.id} page 1")
     db.commit()
     db.refresh(rx)
-    return _to_out(rx)
+    return page_out(rx)
+
+
+def _mine_q(db: Session, user: User):
+    return (db.query(Prescription).join(Consultation, Prescription.consultation_id == Consultation.id)
+            .filter(or_(Consultation.doctor_id == user.id, Consultation.doctor_id.is_(None))))
 
 
 @app.get("/api/prescriptions", response_model=List[PrescriptionOut])
@@ -330,21 +269,15 @@ def list_prescriptions(
     limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0),
     db: Session = Depends(get_db), user: User = Depends(doctor_only),
 ):
-    rows = (
-        db.query(Prescription).order_by(Prescription.created_at.desc())
-        .offset(offset).limit(limit).all()
-    )
-    return [_to_out(r) for r in rows]
+    rows = _mine_q(db, user).order_by(Prescription.created_at.desc()).offset(offset).limit(limit).all()
+    return [page_out(r) for r in rows]
 
 
 @app.get("/api/prescriptions/{prescription_id}", response_model=PrescriptionOut)
 def get_prescription(
     prescription_id: str, db: Session = Depends(get_db), user: User = Depends(doctor_only)
 ):
-    rx = db.get(Prescription, prescription_id)
-    if not rx:
-        raise HTTPException(404, "Prescription not found")
-    return _to_out(rx)
+    return page_out(owned_page(db, user, prescription_id))
 
 
 @app.post("/api/prescriptions/{prescription_id}/corrections")
@@ -357,75 +290,42 @@ def add_correction(
     This is the training corpus (§8.3) and the clinical audit trail. The
     predicted value is read from the stored result rather than trusted from the
     client, so before/after is always the model's actual output.
-    """
-    rx = db.get(Prescription, prescription_id)
-    if not rx:
-        raise HTTPException(404, "Prescription not found")
 
+    A corrected NAME goes back through S3 (pipeline.reresolve): the old route
+    stored the new brand beside the OLD composition, so the interaction check
+    kept screening the drug the model misread.
+    """
+    rx = owned_page(db, user, prescription_id)
+    if body.field not in EDITABLE_FIELDS:
+        raise HTTPException(422, f"field must be one of: {', '.join(sorted(EDITABLE_FIELDS))}")
     meds = json.loads(rx.resolved_json)
-    predicted, conf, score, outcome, verification = None, None, None, None, None
-    if 0 <= body.medicine_index < len(meds):
-        m = meds[body.medicine_index]
-        predicted = str(m.get(body.field))
-        conf, score = m.get("confidence"), m.get("match_score")
-        outcome, verification = m.get("outcome"), m.get("verification")
+    if not 0 <= body.medicine_index < len(meds):
+        raise HTTPException(404, "Medicine not found")
+    m = meds[body.medicine_index]
 
     c = Correction(
         prescription_id=rx.id, medicine_index=body.medicine_index,
-        field=body.field, predicted_value=predicted,
+        field=body.field, predicted_value=None if m.get(body.field) is None else str(m.get(body.field)),
         corrected_value=body.corrected_value,
-        correction_type=body.correction_type, model_confidence=conf,
-        match_score=score, outcome=outcome, verification=verification,
+        correction_type=body.correction_type, model_confidence=m.get("confidence"),
+        match_score=m.get("match_score"), outcome=m.get("outcome"),
+        verification=m.get("verification"),
         # Who made the edit comes from the session, not the request body: an
         # audit trail the client can write its own name into is not one.
         corrected_by=user.id, note=body.note,
     )
     db.add(c)
 
-    # Apply the edit so the UI reflects it immediately.
-    if 0 <= body.medicine_index < len(meds):
-        meds[body.medicine_index][body.field] = body.corrected_value
-        rx.resolved_json = json.dumps(meds)
+    if body.field == "brand":
+        meds[body.medicine_index] = pipeline.reresolve(m, body.corrected_value)
+    else:
+        m[body.field] = (body.corrected_value or "").strip() or None
+    rx.resolved_json = json.dumps(meds)
+    consultation = rx.consultation
+    recompute(db, consultation)
+    mark_changed(consultation)
     db.commit()
-    return {"ok": True, "correction_id": c.id}
-
-
-@app.post("/api/prescriptions/{prescription_id}/review")
-def mark_reviewed(
-    prescription_id: str, db: Session = Depends(get_db), user: User = Depends(doctor_only)
-):
-    """Confirm a page. An unchanged page is a fully labelled page — the majority
-    class — and is worthless to a later training run if only edits are stored."""
-    rx = db.get(Prescription, prescription_id)
-    if not rx:
-        raise HTTPException(404, "Prescription not found")
-    rx.reviewed_at = datetime.now(timezone.utc)
-    rx.reviewed_by = user.id
-    db.commit()
-    return {"ok": True, "reviewed_at": rx.reviewed_at.isoformat()}
-
-
-class PatientPhoneIn(BaseModel):
-    phone: Optional[str] = Field(None, description="Empty to stop sharing with a patient")
-
-
-@app.put("/api/prescriptions/{prescription_id}/patient")
-def set_patient_phone(
-    prescription_id: str, body: PatientPhoneIn, request: Request,
-    db: Session = Depends(get_db), user: User = Depends(doctor_only),
-):
-    """Address a prescription to a patient's phone. It reaches their app once the
-    page is also confirmed, and only if they have verified that number."""
-    rx = db.get(Prescription, prescription_id)
-    if not rx:
-        raise HTTPException(404, "Prescription not found")
-    phone = norm_phone(body.phone) if (body.phone or "").strip() else None
-    if phone != rx.patient_phone:
-        rx.patient_phone = phone
-        # Who sent patient data where is part of the audit trail.
-        _event(db, request, "rx_patient_set", user.id, f"{rx.id} -> {phone or 'none'}")
-        db.commit()
-    return {"ok": True, "patient_phone": rx.patient_phone}
+    return {"ok": True, "correction_id": c.id, "medicine": meds[body.medicine_index]}
 
 
 class InteractionCheckIn(BaseModel):
@@ -442,22 +342,30 @@ def check_interactions(body: InteractionCheckIn):
     """
     if len([m for m in body.medicines if m.strip()]) < 2:
         return InteractionOutcome(medicines_checked=body.medicines)
-    return InteractionOutcome(**_checker.check(body.medicines))
+    return InteractionOutcome(**pipeline.checker.check(body.medicines))
 
 
 @app.get("/api/stats")
 def stats(db: Session = Depends(get_db), user: User = Depends(doctor_only)):
-    total = db.query(Prescription).count()
-    reviewed = db.query(Prescription).filter(Prescription.reviewed_at.isnot(None)).count()
-    corrections = db.query(Correction).count()
+    pages = _mine_q(db, user)
+    total = pages.count()
+    reviewed = pages.filter(Prescription.reviewed_at.isnot(None)).count()
+    ids = [rx.id for rx in pages.all()]
+    corrections = db.query(Correction).filter(Correction.prescription_id.in_(ids)).count() if ids else 0
+    consultations = db.query(Consultation).filter(
+        or_(Consultation.doctor_id == user.id, Consultation.doctor_id.is_(None)))
     meds = confirmed = 0
-    for (blob,) in db.query(Prescription.resolved_json).all():
-        rows = json.loads(blob)
+    for rx in pages.all():
+        # Coverage measures the READER, so it counts what the model produced:
+        # lines the doctor added or struck are excluded.
+        rows = [m for m in json.loads(rx.resolved_json) if not m.get("doctor_entered")]
         meds += len(rows)
         confirmed += sum(1 for m in rows if m["outcome"] in ("confirmed", "probable"))
     guard = get_guard()
     return {
         "total_prescriptions": total,
+        "consultations": consultations.count(),
+        "finalised": consultations.filter(Consultation.current_version > 0).count(),
         "reviewed": reviewed,
         "total_medicines": meds,
         # Coverage is the honest headline number for a system that may abstain.
@@ -475,7 +383,9 @@ def list_corrections(
 ):
     """The training corpus so far. Also how you check the log is complete
     before trusting any calibration run (§16.6 step 1)."""
-    rows = db.query(Correction).order_by(Correction.created_at.desc()).limit(limit).all()
+    ids = [rx.id for rx in _mine_q(db, user).all()]
+    rows = (db.query(Correction).filter(Correction.prescription_id.in_(ids))
+            .order_by(Correction.created_at.desc()).limit(limit).all()) if ids else []
     return [
         {
             "id": c.id, "prescription_id": c.prescription_id,
@@ -494,13 +404,43 @@ def list_corrections(
 
 
 @app.get("/uploads/{name}")
-def uploaded_image(name: str, user: User = Depends(doctor_only)):
-    """Prescription images are patient data: served to signed-in doctors only,
-    never as an open static directory."""
+def uploaded_image(name: str, db: Session = Depends(get_db), user: User = Depends(doctor_only)):
+    """Prescription images are patient data: served only to the doctor whose
+    consultation the page belongs to, never as an open static directory."""
     path = (UPLOAD_DIR / name).resolve()
     if path.parent != UPLOAD_DIR.resolve() or not path.is_file():
         raise HTTPException(404, "Not found")
-    return FileResponse(path)
+    rx = db.query(Prescription).filter(Prescription.image_path.like(f"%{path.name}")).first()
+    if not rx or not rx.consultation_id:
+        raise HTTPException(404, "Not found")
+    owned_page(db, user, rx.id)
+    return image_response(path)
+
+
+@app.get("/api/verify/{verification_id}")
+def verify_document(verification_id: str, request: Request, db: Session = Depends(get_db)):
+    """Public: what the QR on a prescription PDF opens.
+
+    Answers only "is this a genuine prescription, from whom, and is it the
+    current version". No patient name, no medicines, no diagnosis: anyone who
+    holds the paper can scan it, so the answer must not be a copy of it."""
+    _throttle("verify_ip", _ip(request), 30, 60)
+    vid = verification_id.strip().upper()
+    v = db.query(ConsultationVersion).filter(ConsultationVersion.verification_id == vid).first()
+    if not v:
+        return {"valid": False, "verification_id": vid}
+    c = v.consultation
+    snap = json.loads(v.snapshot_json)
+    doc = snap.get("doctor") or {}
+    latest = c.versions[-1] if c.versions else v
+    return {
+        "valid": True, "verification_id": vid, "version": v.version,
+        "latest_version": latest.version, "superseded": latest.version > v.version,
+        "finalised_at": aware(v.finalised_at).isoformat(),
+        "doctor_name": doc.get("name"), "registration_no": doc.get("registration_no"),
+        "speciality": doc.get("speciality"), "clinic_address": doc.get("clinic_address"),
+        "medicine_count": len(snap.get("medicines", [])),
+    }
 
 
 # ─── the built frontend (production image only) ─────────────────────────────

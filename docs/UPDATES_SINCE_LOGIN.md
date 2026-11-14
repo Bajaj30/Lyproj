@@ -1,5 +1,9 @@
 # Updates since the login pages
 
+> **Update (Session 9, 14 Nov 2026):** the stored-XSS hole in §6 is **fixed**, and
+> open items 1 and 3–6 below are done. See [§8](#8-session-9-the-rest-of-the-workflow)
+> and [`claude.md`](../claude.md), Session 9.
+
 This covers everything after commit `1bd1a0b` ("Add accounts for doctors, patients and
 pharmacies"), up to 20 Oct 2026. The changes are on `main` at
 [Sahil-Jawale/Lyproj](https://github.com/Sahil-Jawale/Lyproj), except the security
@@ -15,7 +19,8 @@ findings in §6, which came after the push. The detailed engineering log is
 | [Phone verification](#3-phone-codes-are-sent-by-email-prototype) | Phone codes are emailed (no SMS provider yet). A local demo inbox shows them. | ✅ working, prototype only |
 | [Bug fixes](#4-bugs-fixed-along-the-way) | Two security bugs in code delivery, plus several smaller ones | ✅ fixed |
 | [Model research](#5-model-research-no-code-change) | Which vision model to use, via OpenRouter | 📝 advice only |
-| [Security review](#6-security-review-ftp-sip-http) | FTP and SIP not applicable; **one confirmed stored-XSS hole** | ⚠️ **not fixed yet** |
+| [Security review](#6-security-review-ftp-sip-http) | FTP and SIP not applicable; one confirmed stored-XSS hole | ✅ fixed in Session 9 |
+| [Session 9](#8-session-9-the-rest-of-the-workflow) | Consultations, versions, pharmacy sharing, pack checks, QR verification, API-key slot | ✅ working (mock reader) |
 | [Git](#7-what-was-pushed) | Pushed to the fork's `main` without a force-push | ✅ done |
 
 ---
@@ -191,7 +196,7 @@ Recommendations for when the mock reader is switched off. Prices are from OpenRo
 - **The session cookie** is `HttpOnly` and `SameSite=Lax`.
 - **Email header injection** is blocked by normalised inputs plus Python's email library.
 
-**⚠️ Confirmed, not yet fixed: stored XSS through uploads.**
+**✅ Fixed in Session 9 (was confirmed): stored XSS through uploads.**
 - The upload route keeps the extension from the client's filename, and `/uploads/` chooses the content type from that extension.
 - So a valid JPEG named `rx.html` is served back as `text/html` from the site's own origin.
 - In Chrome its script ran and called the logged-in API as the viewer. `.svg` gets through the same way.
@@ -199,11 +204,11 @@ Recommendations for when the mock reader is switched off. Prices are from OpenRo
 - **Who gets hit:** other doctors, and patients through the patient image route.
 
 **Weaker spots:**
-- **A path in the filename** (`x./../../escaped`): a `500` in Docker, but on a Windows dev server the file could be written outside `uploads/` (not tested).
-- **No security headers:** no Content-Security-Policy, `nosniff` or `X-Frame-Options`.
+- **A path in the filename** (`x./../../escaped`, *closed in Session 9: the name is never used*): a `500` in Docker, but on a Windows dev server the file could be written outside `uploads/` (not tested).
+- **No security headers:** no Content-Security-Policy, `nosniff` or `X-Frame-Options`. *(Added in Session 9.)*
 - **Plain HTTP:** fine on localhost only. A real deployment needs TLS, `COOKIE_SECURE=true` and HSTS.
 
-**Planned fix (small):**
+**The fix (Session 9), as planned:**
 - Pick the stored extension from the image's real format, never the filename.
 - Serve uploads with `nosniff` and a fixed image content type.
 - Add a security-headers middleware: CSP, `nosniff`, `frame-ancestors 'none'`, Referrer-Policy.
@@ -224,11 +229,33 @@ Recommendations for when the mock reader is switched off. Prices are from OpenRo
 
 | # | Item |
 |---|---|
-| 1 | **Fix the stored-XSS upload hole** (§6) |
+| 1 | ~~Fix the stored-XSS upload hole (§6)~~ **done, Session 9** |
 | 2 | Real SMS provider (phone codes are emailed for now) |
-| 3 | Confirmed prescriptions can still be edited, and the patient sees changes silently; Workflow wants labelled versions |
-| 4 | One page per prescription; multi-page arrives with Workflow stage 1 |
-| 5 | No QR on the PDF until a verification endpoint exists |
-| 6 | Pharmacy screens (Workflow stages 5–7) are still placeholders |
+| 3 | ~~Silent edits after confirming~~ **done:** immutable versions, labelled revisions |
+| 4 | ~~One page per prescription~~ **done:** multi-page consultations |
+| 5 | ~~No QR on the PDF~~ **done:** QR → public `/check/<id>` |
+| 6 | ~~Pharmacy placeholders~~ **done:** stages 5–7 built |
 | 7 | Doctor and pharmacy sign-ups are not vetted |
 | 8 | Encrypt `mfa_secret`; move rate limiting to Redis before running several workers |
+
+---
+
+## 8. Session 9: the rest of the workflow
+
+Every Workflow.md stage is now built. It runs on the mock reader until an API key is added.
+
+| Area | What changed |
+|---|---|
+| **API key slot** | `READER=auto`: the mock reader while `ANTHROPIC_API_KEY` is empty, Claude once it is set. Paste the key into `.env` (or `.env.docker`) and restart. The UI shows "Demo reader" while on the mock. |
+| **Consultations** (stage 1) | Patient name + phone, clinic from the doctor's profile, up to 10 pages, one interaction check across all pages. Doctors see only their own. |
+| **Review + finalise** (stage 3) | Correct (names re-resolve their ingredients), add missed lines, strike invented ones. Finalising writes an immutable version; later edits become a labelled revision. |
+| **Diagnosis** | Read from the page verbatim (prompt v2), editable, with visibility: patient only, patient and pharmacy, or hidden. |
+| **Sharing** (stage 5) | Patient gets a 6-digit, single-use code for one pharmacy; 15-minute read-only access; revocable. |
+| **Pack checks** (stage 6) | QR, photo or typed; compared by ingredients and strength: match, substitute, strength/form mismatch, wrong medicine, could not verify. |
+| **Expiry** (stage 7) | Enforced by the server on every request (`410`). The pharmacy keeps only a minimal dispensing record. |
+| **QR verification** | The PDF's QR opens `/check/<id>`: genuine?, doctor, current or superseded. No patient data. |
+| **Security** | The §6 upload XSS is fixed; security headers and a CSP on every response. |
+
+Checks: 23 dispensing unit checks, 98 API checks, 38 browser checks, all passing on the
+mock reader and a labelled test fixture (the real medicine CSVs are not in this
+checkout). Not yet verified: the Claude pack reader live, and the Docker image rebuild.

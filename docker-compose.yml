@@ -10,7 +10,10 @@ services:
     ports: ["127.0.0.1:8000:8000"]
     env_file: .env.docker          # SECRET_KEY; gitignored, see README
     environment:
-      READER: mock                 # no API key in the container, no spend
+      # auto: the mock reader until ANTHROPIC_API_KEY is set in .env.docker,
+      # then Claude. Empty key = no spend; the UI shows "Demo reader".
+      READER: auto
+      PUBLIC_BASE_URL: http://localhost:8000   # what the PDF's QR opens
       PRESCRIPTAI_SPEND_CAP: "5"   # .env is not copied in; keep the same cap
       COOKIE_SECURE: "false"       # plain http on localhost
       CORS_ORIGINS: http://localhost:8000,http://127.0.0.1:8000

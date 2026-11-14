@@ -1,6 +1,9 @@
 # PrescriptAI — Architecture v2
 
-**Status:** Proposed — revision 3
+**Status:** Proposed — revision 3. *Implemented through Session 9: S0–S5 plus the
+Workflow.md product stages. What was actually built, and where it departs from this
+document, is in [`claude.md`](../claude.md); the product flow is in
+[`Workflow.md`](../Workflow.md).*
 **Supersedes:** the TrOCR-fine-tuning pipeline in `ml_pipeline/ocr/`
 **Author:** Shivam Bajaj
 **Date:** 2026-08-30
