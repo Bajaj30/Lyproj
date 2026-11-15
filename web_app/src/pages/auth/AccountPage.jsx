@@ -23,6 +23,7 @@ const PROFILE_KEYS = {
   doctor: ['speciality', 'clinic_address', 'registration_no'],
   chemist: ['pharmacy_name', 'pharmacy_address', 'drug_licence_no'],
   patient: [],
+  admin: [],
 }
 
 function Section({ icon: Icon, title, desc, children, action }) {

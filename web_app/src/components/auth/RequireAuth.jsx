@@ -2,6 +2,7 @@ import { Navigate, useLocation } from 'react-router-dom'
 import { Loader2 } from 'lucide-react'
 import { useAuthStore } from '../../store/useAuthStore'
 import { ROLE_HOME } from '../../services/auth'
+import AwaitingVerification from './AwaitingVerification'
 
 /**
  * Route guard. The server enforces access on every request; this only keeps
@@ -24,5 +25,9 @@ export default function RequireAuth({ roles, children }) {
   if (roles && !roles.includes(user.role)) {
     return <Navigate to={ROLE_HOME[user.role] || '/'} replace />
   }
+  // A doctor or pharmacy that an administrator has not approved yet. The API
+  // refuses every clinical route for them (403); this says why, instead of a
+  // screen full of errors.
+  if (roles && !user.can_practise) return <AwaitingVerification />
   return children
 }

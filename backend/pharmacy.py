@@ -33,6 +33,7 @@ from datetime import timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -41,7 +42,7 @@ from access import (
     ACTIVE, ISSUED, check_out, checks_for, dispensed_indexes, dispensing_state, grant_status,
     hash_otp, latest_version, med_key, now, snapshot,
 )
-from auth import Role, User, require_roles
+from auth import Role, User, require_vetted
 from auth import ratelimit as rl
 from auth.models import aware
 from auth.routes import _event, _ip
@@ -51,7 +52,8 @@ from models import AccessGrant, DispenseCheck, DispensingRecord
 from views import UPLOAD_DIR, image_response
 
 router = APIRouter(prefix="/api/pharmacy", tags=["pharmacy"])
-chemist_only = require_roles(Role.CHEMIST)
+# Signed in as a pharmacy AND approved by an administrator (admin.py).
+chemist_only = require_vetted(Role.CHEMIST)
 
 REDEEM_FAIL_LIMIT, REDEEM_FAIL_WINDOW = 5, 15 * 60
 BAD_CODE = "That code is not valid, has expired, or has already been used. Ask the patient for a new one."
@@ -294,9 +296,10 @@ async def check_pack(
         if len(data) > 10 * 1024 * 1024:
             raise HTTPException(413, "That photo is over 10 MB.")
         try:
-            label = pipeline.pack_reader.read(data)
+            # Off the event loop: a real read takes seconds.
+            label = await run_in_threadpool(pipeline.pack_reader.read, data)
         except Exception as exc:
-            raise HTTPException(502, f"Pack reader failed: {exc}") from exc
+            raise pipeline.reader_http_error(exc) from exc
         # The photo itself is not kept: only what was read from it.
         pack = PackIdentity(source="photo", brand=label.brand, generic_name=label.generic_name,
                             strength=label.strength, form=label.form, manufacturer=label.manufacturer,

@@ -34,7 +34,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from env import load_env  # noqa: E402
 from ingest.normalise import normalise  # noqa: E402
 from vlm.page_reader import DEFAULT_MODEL, resolve_reader_kind  # noqa: E402
-from vlm.spend import get_guard, price_call  # noqa: E402
 
 PACK_PROMPT_VERSION = "pack-v1"
 
@@ -98,20 +97,22 @@ class MockPackReader:
 class ClaudePackReader:
     is_mock = False
 
-    def __init__(self, model: str = DEFAULT_MODEL, effort: str = "low"):
-        import anthropic
+    def __init__(self, model: str = DEFAULT_MODEL, effort: str = "low", caller=None):
+        from vlm.client import ClaudeCaller
 
         load_env()
-        self.client = anthropic.Anthropic()
+        # Shares retries, timeouts, the concurrency cap, the spend cap and
+        # refusal handling with the page reader (vlm/client.py).
+        self.caller = caller or ClaudeCaller()
         self.model = model
         self.effort = effort
-        self.last_raw_response: Optional[dict] = None
 
     def read(self, image: bytes) -> PackLabel:
         img = normalise(image)
-        guard = get_guard()
-        guard.check_before_call()
-        response = self.client.messages.parse(
+        done = self.caller.parse(
+            warm_key=f"pack:{self.model}:{self.effort}:{PACK_PROMPT_VERSION}",
+            estimated_usd=0.02,
+            spend_tag=f"pack-{img.sha256[:8]}",
             model=self.model,
             max_tokens=4000,
             thinking={"type": "adaptive"},
@@ -130,14 +131,12 @@ class ClaudePackReader:
             }],
             output_format=PackLabel,
         )
-        self.last_raw_response = response.model_dump(mode="json", warnings=False)
-        guard.record(price_call(self.model, response.usage), tag=f"pack-{img.sha256[:8]}")
-        return response.parsed_output
+        return done.parsed
 
 
-def build_pack_reader(kind: str = "auto"):
+def build_pack_reader(kind: str = "auto", caller=None):
     kind = resolve_reader_kind(kind)
     if kind == "claude":
         # Printed labels need far less reasoning than handwriting: effort low.
-        return ClaudePackReader(model=DEFAULT_MODEL, effort="low")
+        return ClaudePackReader(model=DEFAULT_MODEL, effort="low", caller=caller)
     return MockPackReader()

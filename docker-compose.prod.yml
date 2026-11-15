@@ -1,0 +1,58 @@
+# PrescriptAI behind HTTPS. A separate, complete file: do not combine it with
+# docker-compose.yml (which is the local demo: plain http, Mailpit, localhost only).
+#
+#   cp .env.docker.example .env.production      # then fill it in
+#   SITE_ADDRESS=rx.example.in PUBLIC_URL=https://rx.example.in \
+#     docker compose -f docker-compose.prod.yml up --build -d
+#   docker compose -f docker-compose.prod.yml exec -u app prescriptai python manage.py create-admin
+#
+# What differs from the demo, and why:
+#   * The app's port is NOT published. Only the proxy can reach it, which is
+#     also what makes trusting X-Forwarded-For safe (FORWARDED_ALLOW_IPS).
+#   * COOKIE_SECURE=true: the session cookie is HTTPS-only and the app sends HSTS.
+#   * No Mailpit. Codes must really be delivered: set SMTP_* and SMS_DELIVERY
+#     in .env.production. Until you do, they are printed in the container log.
+#   * Doctors and pharmacies must be approved by an administrator (the default).
+#
+# Before real patients: read docs/API_IMPLEMENTATION.md §2 (the checklist).
+services:
+  prescriptai:
+    build: .
+    image: prescriptai:local
+    env_file: .env.production
+    environment:
+      READER: auto
+      COOKIE_SECURE: "true"
+      REQUIRE_VETTING: "true"
+      DEBUG: "false"
+      PUBLIC_BASE_URL: ${PUBLIC_URL:?set PUBLIC_URL, e.g. https://rx.example.in}
+      CORS_ORIGINS: ${PUBLIC_URL}
+      FORWARDED_ALLOW_IPS: "*"       # safe only because no port is published here
+    expose: ["8000"]
+    volumes:
+      - ./ml_pipeline/data/india:/app/ml_pipeline/data/india:ro
+      - prescriptai_data:/app/data
+      - prescriptai_uploads:/app/backend/uploads
+      - prescriptai_cache:/app/ml_pipeline/.cache
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2.10-alpine
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS, e.g. rx.example.in}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data             # certificates: keep this volume
+      - caddy_config:/config
+    depends_on: [prescriptai]
+    restart: unless-stopped
+
+volumes:
+  prescriptai_data:
+  prescriptai_uploads:
+  prescriptai_cache:
+  caddy_data:
+  caddy_config:

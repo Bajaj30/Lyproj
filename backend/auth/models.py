@@ -5,9 +5,14 @@ One `users` table for all three stakeholders — doctor, patient, chemist — wi
 the role as a column. They share every credential mechanism; what differs is
 the profile they fill in and the routes they may call.
 
-Nothing here stores a usable secret except `mfa_secret`, which the TOTP check
-needs in the clear. It should be encrypted at rest with a KMS-held key before
-production (the `cryptography` package is not installed today).
+Nothing here stores a usable secret in the clear. Passwords, tokens and codes
+are hashed. `mfa_secret` must be readable by the server (the TOTP check needs
+it), so it is ENCRYPTED at rest with a key held outside the database
+(auth/crypto.py).
+
+Vetting (Workflow.md §10 Q5): a doctor or pharmacy account starts `pending` and
+cannot touch a prescription until an administrator has reviewed its
+registration / licence details and approved it (admin.py).
 
 SQLite note: `DateTime(timezone=True)` round-trips as a NAIVE datetime on
 SQLite. Everything is written in UTC, and `aware()` re-attaches the zone on
@@ -35,6 +40,8 @@ from sqlalchemy.orm import relationship
 from config.database import Base
 from models import _now, _uuid
 
+from .crypto import EncryptedString
+
 
 def aware(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
@@ -46,6 +53,19 @@ class Role(str, enum.Enum):
     DOCTOR = "doctor"
     PATIENT = "patient"
     CHEMIST = "chemist"
+    # Reviews doctor and pharmacy accounts. Never created through /register:
+    # only by the operator, with `python manage.py create-admin`.
+    ADMIN = "admin"
+
+
+class Vetting(str, enum.Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+# Roles that issue or dispense prescriptions, and so must be vetted first.
+VETTED_ROLES = (Role.DOCTOR, Role.CHEMIST)
 
 
 class User(Base):
@@ -73,11 +93,26 @@ class User(Base):
     profile_json = Column(Text, default="{}")
 
     mfa_enabled = Column(Boolean, default=False, nullable=False)
-    mfa_secret = Column(String)          # active TOTP secret
-    mfa_pending_secret = Column(String)  # set during enrolment, until confirmed
+    mfa_secret = Column(EncryptedString)          # active TOTP secret, encrypted at rest
+    mfa_pending_secret = Column(EncryptedString)  # set during enrolment, until confirmed
     mfa_last_step = Column(Integer)      # last accepted TOTP step — replay guard
 
     is_active = Column(Boolean, default=True, nullable=False)
+
+    # Doctor / pharmacy vetting. A plain string so an account created before
+    # vetting existed (NULL) reads as pending rather than failing to load.
+    vetting_status = Column(String, index=True)
+    vetted_at = Column(DateTime(timezone=True))
+    vetted_by = Column(String)
+    vetting_note = Column(Text)
+
+    @property
+    def needs_vetting(self) -> bool:
+        return self.role in VETTED_ROLES
+
+    @property
+    def is_vetted(self) -> bool:
+        return not self.needs_vetting or self.vetting_status == Vetting.APPROVED.value
 
     sessions = relationship("AuthSession", back_populates="user", cascade="all, delete-orphan")
     recovery_codes = relationship("RecoveryCode", back_populates="user", cascade="all, delete-orphan")

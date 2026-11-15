@@ -15,5 +15,10 @@ PyYAML==6.0.1
 rapidfuzz==3.14.3
 networkx==3.5
 fpdf2==2.8.9
+# Encryption at rest for two-step secrets (auth/crypto.py). The one auth
+# dependency outside the standard library: it has no authenticated cipher.
+cryptography==50.0.2
+# Database migrations (backend/migrations, config/migrate.py).
+alembic==1.20.1
 # QR code on the prescription PDF (pure Python, no Pillow plugin needed).
 segno==1.6.6

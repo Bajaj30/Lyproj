@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -18,7 +19,10 @@ from pydantic import BaseModel, Field
 from auth.models import aware
 from config.settings import settings
 
-UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+# PRESCRIPTAI_UPLOAD_DIR moves the stored page images, e.g. onto a mounted
+# volume, or into a temp directory so a test run never touches real ones.
+UPLOAD_DIR = Path(os.environ.get("PRESCRIPTAI_UPLOAD_DIR")
+                  or Path(__file__).resolve().parent / "uploads").resolve()
 
 # Stored extension -> served type. The extension is chosen from the image's real
 # format at upload (consultations.ingest_page), never from the client's filename,

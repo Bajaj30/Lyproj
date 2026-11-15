@@ -1,0 +1,16 @@
+# HTTPS in front of PrescriptAI (docker-compose.prod.yml).
+#
+# With a real domain in SITE_ADDRESS (e.g. rx.example.in) Caddy obtains and
+# renews a Let's Encrypt certificate by itself; ports 80 and 443 must reach this
+# machine. With "localhost" it issues a certificate from its own local CA, which
+# is enough to try the HTTPS setup on one machine (browsers will warn).
+{$SITE_ADDRESS:localhost} {
+	encode zstd gzip
+
+	# One upload can carry 10 pages of up to 10 MB each.
+	request_body {
+		max_size 120MB
+	}
+
+	reverse_proxy prescriptai:8000
+}

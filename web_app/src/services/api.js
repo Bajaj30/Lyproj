@@ -93,6 +93,19 @@ export const uploadPage = (consultationId, file) => {
     headers: { 'Content-Type': 'multipart/form-data' },
   }))
 }
+/**
+ * Several pages in ONE request. The server drops exact duplicates before the
+ * reader is called, reads the rest in parallel, and answers per file:
+ * { consultation, results: [{ filename, status: 'added'|'duplicate'|'failed', page_no, detail }] }.
+ * A longer timeout than usual: it covers every page, not one.
+ */
+export const uploadPages = (consultationId, files) => {
+  const form = new FormData()
+  files.forEach((f) => form.append('images', f))
+  return data(api.post(`/api/consultations/${consultationId}/pages/batch`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' }, timeout: 300000,
+  }))
+}
 export const deletePage = (consultationId, pageId) =>
   data(api.delete(`/api/consultations/${consultationId}/pages/${pageId}`))
 export const addMedicine = (consultationId, body) =>
@@ -101,10 +114,21 @@ export const removeMedicine = (pageId, index, note) =>
   data(api.post(`/api/prescriptions/${pageId}/medicines/${index}/remove`, { note: note || null }))
 export const restoreMedicine = (pageId, index) =>
   data(api.post(`/api/prescriptions/${pageId}/medicines/${index}/restore`))
-export const finaliseConsultation = (id, { acknowledgeUnresolved = false, changeNote = '' } = {}) =>
+export const finaliseConsultation = (id, {
+  acknowledgeUnresolved = false, acknowledgeDuplicates = false, changeNote = '',
+} = {}) =>
   data(api.post(`/api/consultations/${id}/finalise`, {
-    acknowledge_unresolved: acknowledgeUnresolved, change_note: changeNote || null,
+    acknowledge_unresolved: acknowledgeUnresolved, acknowledge_duplicates: acknowledgeDuplicates,
+    change_note: changeNote || null,
   }))
+
+// ── administrator: vetting doctors and pharmacies ───────────────────────────
+
+export const getVettingAccounts = (status = 'pending') =>
+  data(api.get('/api/admin/accounts', { params: { status } }))
+export const getVettingSummary = () => data(api.get('/api/admin/summary'))
+export const decideVetting = (userId, decision, note) =>
+  data(api.post(`/api/admin/accounts/${userId}/vetting`, { decision, note: note || null }))
 
 /** Public: what the QR on a prescription PDF opens. */
 export const verifyDocument = (vid) => data(api.get(`/api/verify/${encodeURIComponent(vid)}`))

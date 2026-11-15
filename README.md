@@ -103,6 +103,8 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 │   │   ├── prompts.py        S1 system prompt; PROMPT_VERSION + fingerprint
 │   │   ├── page_reader.py    S1 readers: MockPageReader, ClaudePageReader, CachedPageReader
 │   │   ├── pack_reader.py    stage 6: reads a photographed pack label (mock / Claude)
+│   │   ├── client.py         the ONE place that calls the API: retries, timeouts,
+│   │   │                     concurrency cap, refusals, safe errors (docs/API_IMPLEMENTATION.md)
 │   │   ├── spend.py          spend ledger + hard cap
 │   │   └── vocab.py          S2 (+ calls S3): resolve_page()
 │   ├── normalise/
@@ -127,6 +129,9 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 │   ├── access.py             grant status, OTP hashing, dispensing state
 │   ├── views.py              shared response shapes, verification IDs
 │   ├── rx_pdf.py             the prescription PDF (fpdf2 + segno QR)
+│   ├── admin.py              administrators approve doctor and pharmacy accounts
+│   ├── manage.py             operator CLI: create-admin, pending, migrate, new-key
+│   ├── alembic.ini, migrations/   database migrations (config/migrate.py runs them)
 │   ├── models.py             SQLAlchemy: consultations, versions, pages, corrections,
 │   │                         interaction runs, grants, dispense checks, records
 │   ├── auth/                 accounts for every stakeholder (§6a)
@@ -136,7 +141,7 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 │   │   ├── security.py       scrypt, token/code hashing, TOTP (stdlib only)
 │   │   ├── notify.py         code delivery: SMTP email, else console
 │   │   └── ratelimit.py      in-memory throttling
-│   ├── config/               settings.py, database.py (SQLite by default)
+│   ├── config/               settings.py, database.py (SQLite by default), migrate.py
 │   └── uploads/              uploaded images (gitignored)
 │
 ├── web_app/                  ← main React app (port 5173). Clinical light theme.
@@ -154,9 +159,11 @@ path. The reasoning is in [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md) �
 │       ├── store/            zustand: useAppStore, useAuthStore (who is signed in)
 │       └── data/ddiDrugs.js  210 generics generated from DDI Database.json (autocomplete)
 │
-├── pharmacy_dashboard/       ← separate React app (port 3001). Static demo data only, see §12
+├── tests/                    run.py (one command), e2e_api.py, e2e_browser.py, test_security.py
+├── deploy/                   Caddyfile (HTTPS), docker-entrypoint.sh (drops root)
 ├── Dockerfile                one production image: API + built web app, see §3.5
-└── docker-compose.yml        local hosting on http://localhost:8000
+├── docker-compose.yml        local demo on http://localhost:8000 (Mailpit, plain http)
+└── docker-compose.prod.yml   the same image behind HTTPS (Caddy)
 ```
 
 ---
@@ -182,20 +189,23 @@ cp .env.example .env
 
 ### 2. Python dependencies
 
-The `requirements.txt` files are out of date (§12). Install what the code
-actually imports:
-
 ```bash
-pip install fastapi "uvicorn[standard]" python-multipart sqlalchemy pydantic \
-            pillow numpy pandas rapidfuzz networkx pyyaml python-dotenv anthropic
+python -m venv .venv && .venv/bin/pip install -r backend/requirements.txt
 ```
+
+`ml_pipeline/requirements.txt` is the subset the pipeline needs on its own.
 
 ### 3. Backend
 
 ```bash
 cd backend
+python manage.py create-admin     # once: the account that approves doctors and pharmacies
 python main.py                    # → http://localhost:8000  (docs at /docs)
 ```
+
+Startup applies database migrations. A doctor or pharmacy that registers is
+**pending** until the administrator approves it at `/admin` (§6a). For local
+development only, `REQUIRE_VETTING=false` skips that.
 
 `READER` defaults to `auto`: the Claude reader when `ANTHROPIC_API_KEY` is set in
 `.env`, the mock reader when it is empty. Adding the key and restarting is the only
@@ -245,10 +255,11 @@ One container runs the API **and** serves the built web app, so both are on
 `http://localhost:8000` and the session cookie needs no CORS.
 
 ```bash
-# once: a signing key for one-time and recovery codes (gitignored)
-python -c "import secrets;print('SECRET_KEY='+secrets.token_urlsafe(48))" > .env.docker
+# once: copy the template and fill in SECRET_KEY and DATA_ENCRYPTION_KEY (gitignored)
+cp .env.docker.example .env.docker
 
 docker compose up --build -d      # → http://localhost:8000
+docker compose exec -u app prescriptai python manage.py create-admin   # once
 # verification codes (email AND phone) → the demo inbox at http://localhost:8025
 docker compose down               # stop; data survives in the named volumes
 ```
@@ -260,14 +271,19 @@ docker compose down               # stop; data survives in the named volumes
   mail for any address and forwards none, so codes never leave the machine. Phone
   codes are emailed too: to the account's email, or to `<digits>@sms.prescriptai.local`.
   To send real email instead, set `SMTP_*` to a real server.
-- **Localhost only.** The port is bound to `127.0.0.1`. Don't expose it to a
-  network until doctors are vetted and records are owned per doctor (§12).
-  Anywhere served over HTTPS needs `COOKIE_SECURE=true` and its origin in
-  `CORS_ORIGINS`.
+- **Localhost only, plain http.** The port is bound to `127.0.0.1`. To serve it on
+  a network use the HTTPS file instead, which puts Caddy in front, sets `Secure`
+  cookies and HSTS, and does not publish the app's own port:
+  `SITE_ADDRESS=rx.example.in PUBLIC_URL=https://rx.example.in docker compose -f docker-compose.prod.yml up --build -d`
+  (it reads `.env.production`).
+- **Medicine data** is mounted from `ml_pipeline/data/india/` on the host, read-only.
+  Put the two CSVs there (§9) and restart; no rebuild. Without them uploads answer
+  "the medicine database is not installed" and `/api/health` says `"medicine_data": "missing"`.
+- **Not root.** The server runs as an unprivileged user; the entrypoint hands the
+  volumes to it first, so volumes from an older image keep working.
 - **State** lives in three volumes: `prescriptai_data` (SQLite),
   `prescriptai_uploads` (prescription images) and `prescriptai_cache` (read cache
   and spend ledger). `docker compose down -v` deletes all of it.
-- `pharmacy_dashboard/` isn't included (static demo data, §12).
 
 ---
 
@@ -301,7 +317,7 @@ Base URL `http://localhost:8000`. Interactive docs at `/docs`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/health` | Status, `reader`, `reader_is_mock`, `api_key_configured`, prompt version, spend. **Public.** |
+| GET | `/api/health` | Status, `reader`, `reader_is_mock`, `reader_check` (is the key accepted), `medicine_data`, `phone_codes_by`, `vetting_required`, prompt version, spend. **Public.** |
 | GET | `/api/verify/{verification_id}` | What the PDF's QR opens: genuine?, doctor, registration no., version, `superseded`. **No patient data, no medicines.** **Public**, throttled. |
 | POST | `/api/interactions/check` | Ad-hoc lookup by **generic** names. Bypasses S2/S3. **Public.** |
 | | **Doctor** (`backend/consultations.py`, `main.py`) | |
@@ -309,16 +325,21 @@ Base URL `http://localhost:8000`. Interactive docs at `/docs`.
 | GET | `/api/consultations` | This doctor's consultations |
 | GET | `/api/consultations/{id}` | Working copy: every page, every medicine, ONE interaction check across all pages, `unresolved`, `versions` |
 | PATCH | `/api/consultations/{id}` | Patient, clinic, `diagnosis`, `diagnosis_visibility` (`patient` / `patient_and_pharmacy` / `hidden`), `allow_substitution` |
-| POST | `/api/consultations/{id}/pages` | Multipart `image`. Runs S0→S4 on it and rechecks the whole consultation. `502` if the reader fails. |
+| POST | `/api/consultations/{id}/pages` | Multipart `image`. Runs S0→S4 on it and rechecks the whole consultation. `409` if that image is already a page of it (nothing is read). A reader failure is a `502`/`503`/`504` with a message safe to show. |
+| POST | `/api/consultations/{id}/pages/batch` | Multipart `images` (several). Exact duplicates are dropped first, the rest are read **in parallel**, the interaction check runs once. One result per file: `added` / `duplicate` / `failed`. |
 | DELETE | `/api/consultations/{id}/pages/{page_id}` | Only before the first finalise |
 | POST | `/api/consultations/{id}/medicines` | Add a line the reader missed (`missed` correction). The name goes through S3. |
 | POST | `/api/prescriptions/{page_id}/medicines/{i}/remove` · `/restore` | Strike a line not on the page (`hallucinated` correction) |
 | POST | `/api/prescriptions/{page_id}/corrections` | One field edit. A corrected **name** is re-resolved through S3, so ingredients and the interaction check follow it. |
-| POST | `/api/consultations/{id}/finalise` | Writes immutable version N. `422` while a line is AMBIGUOUS, or unresolved without `acknowledge_unresolved`. `409` if nothing changed. |
+| POST | `/api/consultations/{id}/finalise` | Writes immutable version N. `422` while a line is AMBIGUOUS, unresolved without `acknowledge_unresolved`, or two pages read identically without `acknowledge_duplicates`. `409` if nothing changed. |
 | GET | `/api/consultations/{id}/versions/{n}` | A finalised snapshot |
 | POST | `/api/prescriptions/upload` | Legacy single page: opens a consultation around it |
 | GET | `/api/prescriptions`, `/api/prescriptions/{id}` | Pages (this doctor's) |
 | GET | `/api/stats`, `/api/corrections` | Coverage, totals; the correction corpus (this doctor's) |
+| | **Administrator** (`backend/admin.py`) | |
+| GET | `/api/admin/accounts?status=pending\|approved\|rejected\|all` | Doctor and pharmacy accounts, with the registration / licence number each declared |
+| POST | `/api/admin/accounts/{id}/vetting` | `{"decision": "approve"\|"reject", "note"}`. A rejection needs a note; the applicant sees it. Takes effect on the account's next request. |
+| GET | `/api/admin/summary` | Counts by status |
 | | **Patient** (`backend/patient.py`) | |
 | GET | `/api/patient/prescriptions` | Inbox: finalised prescriptions whose latest version is addressed to their **verified** phone |
 | GET | `/api/patient/prescriptions/{id}` | Latest version: `revised`, diagnosis (unless hidden), medicines with `dispensed`, interactions, `not_checked`, `shares`, `dispensing` |
@@ -333,7 +354,8 @@ Base URL `http://localhost:8000`. Interactive docs at `/docs`.
 | POST | `/api/pharmacy/grants/{id}/checks/{check_id}/confirm` | Chemist confirms an orange result. Red / grey can never be confirmed. |
 | GET | `/api/pharmacy/records` | The minimal dispensing record; survives the end of access |
 
-**Access.** Doctor routes need a signed-in **doctor** and see only their own
+**Access.** Doctor routes need a signed-in **doctor whose account an administrator
+has approved** (`403` until then; the same for pharmacy routes) and see only their own
 consultations (anything else is `404`); pages backfilled from before ownership was
 recorded stay visible to every doctor. Images are served at `/uploads/{name}` to the
 owning doctor only. `corrected_by` / `finalised_by` come from the session, never the
@@ -419,9 +441,10 @@ Opus 5 confidences on handwritten brands cluster at 0.50–0.62, so a hard veto 
 ## 6a. Authentication
 
 One account system for the three stakeholders in [`Workflow.md`](Workflow.md):
-**doctor**, **patient** and **chemist** (shown as "Pharmacy"). Code lives in
-`backend/auth/` and `web_app/src/pages/auth/`. It uses only the Python standard
-library, no new backend dependencies.
+**doctor**, **patient** and **chemist** (shown as "Pharmacy"), plus an
+**administrator** who approves the first and last. Code lives in `backend/auth/`,
+`backend/admin.py` and `web_app/src/pages/auth/`. Passwords, tokens and TOTP use only
+the Python standard library; encrypting TOTP secrets at rest uses `cryptography`.
 
 | Capability | How it works |
 |---|---|
@@ -434,7 +457,10 @@ library, no new backend dependencies.
 | **Email / phone verification** | Code sent at sign-up and whenever a contact is added or changed (which needs the password). A successful reset by code also verifies that channel. |
 | **Passwords** | scrypt (n=2¹⁵, r=8), per-password salt, parameters stored in the hash. 10–128 chars, a small common-password blocklist, must not contain the email/phone/username. |
 | **Audit** | `auth_events`: register, login, login_failed, mfa_*, logout, password_*, *_verified, *_changed, session(s)_revoked, with ip and user agent. |
-| **Throttling** | Per-IP and per-identifier sliding windows: 5 failed logins / 15 min per identifier → `429`. |
+| **Throttling** | Per-IP and per-identifier sliding windows: 5 failed logins / 15 min per identifier → `429`. Counted in the database (`rate_limit_hits`), so limits are shared by every worker and survive a restart; keys are stored as a keyed hash. |
+| **Vetting** | A doctor or pharmacy starts `pending` and gets `403` on every clinical route until an administrator approves it at `/admin`. Rejecting or withdrawing approval takes effect on the next request. Changing the name, registration number, pharmacy name or licence number afterwards sends the account back for review. Approval means a person reviewed the declared number; nothing looks it up in a register. `REQUIRE_VETTING=false` turns this off for local development. |
+| **Administrators** | Created only on the server (`python manage.py create-admin`); `/api/auth/register` refuses the role. |
+| **Secrets at rest** | TOTP secrets are encrypted (Fernet, `enc:v1:…`) with `DATA_ENCRYPTION_KEY`, or a key derived from `SECRET_KEY` if that is unset. Rotate by putting the new key first. |
 
 **Routes** (`/api/auth/…`): `register`, `login`, `login/mfa`, `logout`, `me` (GET/PATCH),
 `me/contact` (PUT), `verify/send`, `verify/confirm`, `password/forgot`,
@@ -448,12 +474,16 @@ identity from the request body.
 **Frontend:** `useAuthStore` holds the profile only (the token is unreadable by
 design). `RequireAuth roles={[...]}` guards routes; a `401` from any API call signs
 the UI out. After login: doctor → `/upload`, patient → `/patient`,
-chemist → `/pharmacy`. Navbar links depend on the role.
+chemist → `/pharmacy`, admin → `/admin`. Navbar links depend on the role. A doctor
+or pharmacy that is not approved yet sees a waiting screen in place of its pages.
 
-**Not production-ready yet** (see §12): codes are printed to the console when SMTP is
-missing, and phone codes are sent by email because there is no SMS provider; the rate limiter is per-process memory; the TOTP
-secret is stored unencrypted; doctors and pharmacies self-register with no licence
-check.
+**Phone codes.** `SMS_DELIVERY=twilio` sends a real text; `webhook` posts to any other
+gateway; the default `email` is the prototype path (Mailpit in Docker), where a
+"verified phone" is not proof of the phone. The real paths are built and tested
+against a stand-in provider, and have never sent a real text (§12).
+
+The full list of security features, and what is still open, is in
+[`docs/API_IMPLEMENTATION.md`](docs/API_IMPLEMENTATION.md) §2.
 
 ---
 
@@ -518,9 +548,19 @@ These come from real bugs and measured failures. The details are in `claude.md`.
 | `CORS_ORIGINS` | localhost:5173, 127.0.0.1:5173, :3001, :3000 | origins allowed to send the session cookie |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | unset | email delivery for codes; unset → printed to the console |
 | `SMTP_STARTTLS` | `true` | `false` for a local server without TLS (Mailpit) |
-| `SMS_DELIVERY` | `email` | Prototype: phone codes are **emailed**, to the account's email or else `<digits>@SMS_EMAIL_DOMAIN`. `console` prints them instead. Needs `SMTP_HOST`. |
+| `SMS_DELIVERY` | `email` | `twilio` / `webhook` send a real text. `email` (prototype) sends the code **by email**, to the account's email or else `<digits>@SMS_EMAIL_DOMAIN`; `console` prints it. |
 | `SMS_EMAIL_DOMAIN` | `sms.prescriptai.local` | Stand-in address for phone-only accounts; only a catch-all inbox like Mailpit receives it |
 | `DEMO_INBOX_URL` | unset | Shown on the verify page as "Open the demo inbox" |
+| `REQUIRE_VETTING` | `true` | Doctors and pharmacies need an administrator's approval. `false` for local development only |
+| `DATA_ENCRYPTION_KEY` | derived from `SECRET_KEY` | Fernet key(s) for TOTP secrets, comma separated, newest first. `python manage.py new-key` |
+| `RATE_LIMIT_BACKEND` | `database` | `memory` for throwaway runs |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` (or `TWILIO_MESSAGING_SERVICE_SID`) | unset | For `SMS_DELIVERY=twilio` |
+| `SMS_WEBHOOK_URL` / `SMS_WEBHOOK_TOKEN` | unset | For `SMS_DELIVERY=webhook`: POSTs `{to, message, purpose}`. HTTPS only, except localhost |
+| `READER_MAX_CONCURRENCY` / `READER_MAX_RETRIES` / `READER_TIMEOUT_SECONDS` | `4` / `2` / `90` | API calls in flight; SDK retries; seconds per attempt |
+| `READER_FALLBACKS` | `default` | `off` never sends the refusal-fallback parameter |
+| `PAGE_READS_PER_DOCTOR_PER_DAY` | `200` | Reader calls per doctor per 24 h (0 = no limit) |
+| `PRESCRIPTAI_UPLOAD_DIR` / `PRESCRIPTAI_CACHE_DIR` | `backend/uploads` / `ml_pipeline/.cache` | Page images; read cache and spend ledger |
+| `FORWARDED_ALLOW_IPS` | localhost | Which proxy may set the client address. `*` only when the app's port is not published |
 | `REDIS_URL`, `CELERY_*`, `ML_SERVICE_URL` | | in `settings.py` but **unused**: scaffolding |
 
 ### Thresholds ([`ml_pipeline/config/thresholds.yaml`](ml_pipeline/config/thresholds.yaml))
@@ -588,7 +628,7 @@ patient data and are gitignored. Keep it that way.
 
 ## 11. Current status
 
-*As of the last journal entry (Session 8). `claude.md` is the source of truth.*
+*As of the last journal entry (Session 10). `claude.md` is the source of truth.*
 
 | Stage | Status |
 |---|---|
@@ -611,7 +651,12 @@ patient data and are gitignored. Keep it that way.
 | QR verification (`/check/<id>`) | ✅ built (Session 9) |
 | Session 9 checks | 23 dispensing unit checks, 98 API checks (incl. the upload-XSS regression), 38 browser checks under the new CSP, on the mock reader + test fixture |
 | Upload stored-XSS (UPDATES_SINCE_LOGIN §6) | ✅ fixed (Session 9): extension from the real image format, images served with a fixed type + `nosniff`, security headers + CSP on every response |
-| pharmacy_dashboard | ⚠️ superseded by `/pharmacy` in web_app. Static BD demo data; safe to delete |
+| API calling: parallel multi-page reads, duplicate handling, refusals, safe errors | ✅ built (Session 10); not yet run against the live API. [`docs/API_IMPLEMENTATION.md`](docs/API_IMPLEMENTATION.md) |
+| Vetting of doctors and pharmacies, administrators | ✅ built (Session 10) |
+| TOTP secrets encrypted; rate limits in the database; Alembic migrations | ✅ built (Session 10) |
+| Real SMS (Twilio / webhook) | 🟡 built and tested against a stand-in; never sent a real text |
+| HTTPS deployment, non-root container | ✅ built (Session 10); checked locally with Caddy's own certificate |
+| Tests in the repo | ✅ `python tests/run.py`: 89 unit, 137 + 6 API, 50 browser checks |
 
 **Open items**
 
@@ -627,19 +672,14 @@ These come from the pre-v2 prototype. They are wrong, so don't trust them.
 
 | File | Problem |
 |---|---|
-| `ml_pipeline/requirements.txt` | The old TrOCR stack (torch, transformers, opencv, pinned to Python 3.10). Not what the pipeline uses now. |
 | `backend/config/settings.py` | `ML_SERVICE_URL`, JWT, Redis and Celery settings are unused scaffolding. |
-| `pharmacy_dashboard/` | Hardcoded demo queue with Bangladeshi brands (Napa, Esoral, ...). Fake confidences. |
-| `web_app/README.md` | Vite template boilerplate |
-| Upload with no CSVs | `resolve_page` sits outside the upload's `try`, so a missing dataset is a 500, not a 502 |
-| Auth: code delivery | No SMS provider. For the prototype, phone codes are **sent by email** (`SMS_DELIVERY=email`), so a "verified" phone means verified by email. In Docker everything lands in Mailpit (`localhost:8025`) and nothing leaves the machine. For real SMS, replace `send_sms` in `backend/auth/notify.py`. |
-| Auth: rate limiting | In-process memory. Resets on restart and isn't shared between workers; move to Redis before scaling out. |
-| Auth: MFA secret | Stored unencrypted (`users.mfa_secret`). Encrypt with a KMS-held key before production. |
-| Auth: vetting | Doctors and pharmacies self-register; the registration / licence number is not checked against any registry (Workflow.md §10 Q5). |
+| Real SMS | Built (`twilio`, `webhook`) and tested against a local stand-in, but it has never sent a real text: that needs a provider account, and for Indian numbers a DLT-registered sender and template. Until `SMS_DELIVERY` is changed, phone codes go by email and a "verified phone" is not proof of the phone. |
+| Spend ledger | Per process (a JSON file plus an in-memory reservation). Run one API worker per ledger; move it into the database before running several. |
+| Encryption key | TOTP secrets are encrypted, but the key lives in the server's environment. That covers a leaked database or backup, not a compromised server; a KMS-held key is the next step. |
+| Vetting is manual | An administrator reviews the registration / licence number by hand. Nothing checks a medical-council or drug-licence register: there is no public API for either (Workflow.md §10 Q5). |
 | Patient medicine information | "What it is used for" needs a content source; only the composition is shown. |
 | Pack QR codes | Only JSON, `Key: value`, GS1 (batch/expiry only) and plain-text payloads are parsed. A link-only QR is reported as "could not verify" (Workflow §10 Q9). |
-| Pharmacy code lock | Per account and per IP, in process memory, like the other rate limits. |
-| Auth: no automated tests in repo | The 77 API + 21 browser checks ran from a scratch script. `fastapi.testclient` is broken here (`httpx` 0.28 vs Starlette 0.35). |
+| Live API | The reader was rewritten in Session 10 and has not been run against the live API since. The checklist is `docs/API_IMPLEMENTATION.md` §1.9. `fastapi.testclient` is still broken here (`httpx` 0.28 vs Starlette 0.35), so the suites in `tests/` drive a real server. |
 
 ---
 
@@ -675,9 +715,9 @@ Continuous improvement is driven by the correction log (ARCH §16):
 `prompt_version`, confidence and alternatives populated, then count corrections by
 type. Build the regression suite first.
 
-Other next steps: delete `pharmacy_dashboard` (superseded), fix the requirements
-files, find a way to distribute the medicine CSVs, and possibly
-expand DDI coverage for acute outpatient drugs.
+Other next steps: run the live-API checklist (`docs/API_IMPLEMENTATION.md` §1.9),
+find a way to distribute the medicine CSVs, and possibly expand DDI coverage for
+acute outpatient drugs.
 
 ---
 
@@ -688,6 +728,8 @@ expand DDI coverage for acute outpatient drugs.
 | Why is it built this way? What was rejected? | [`docs/ARCHITECTURE_V2.md`](docs/ARCHITECTURE_V2.md): §1 TL;DR, §3 rejected approaches, §5 stage specs, §6 VLM choice + cost, §8 human-in-the-loop, §16 roadmap |
 | What actually happened, including bugs and measurements? | [`claude.md`](claude.md), the implementation journal, newest session first |
 | How was the work split? | [`docs/DAY1_PLAN.md`](docs/DAY1_PLAN.md) |
+| How are API calls kept few and cheap? What protects the key and the data? | [`docs/API_IMPLEMENTATION.md`](docs/API_IMPLEMENTATION.md) |
+| How do I run the checks? | `python tests/run.py` ([`tests/run.py`](tests/run.py)) |
 | Exact data shapes | [`ml_pipeline/schemas.py`](ml_pipeline/schemas.py) |
 
 `§` references in code comments point to `docs/ARCHITECTURE_V2.md`.

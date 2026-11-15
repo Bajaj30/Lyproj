@@ -28,6 +28,9 @@ services:
       DEMO_INBOX_URL: http://localhost:8025
     depends_on: [mailpit]
     volumes:
+      # The two medicine CSVs (gitignored; README §9). Put them in this folder
+      # on the host: no rebuild needed, and they never enter the image.
+      - ./ml_pipeline/data/india:/app/ml_pipeline/data/india:ro
       - prescriptai_data:/app/data                    # SQLite
       - prescriptai_uploads:/app/backend/uploads      # prescription images
       - prescriptai_cache:/app/ml_pipeline/.cache     # read cache + spend ledger

@@ -2,6 +2,8 @@
 The pipeline, held once per process, for every router that needs it.
 
     read_page()     S0 -> S1 -> S2 -> S3 on one uploaded page
+    read_pages()    the same for several pages, read in parallel (one result or
+                    one error per page)
     check()         S4 over a list of stored medicine dicts (any number of pages)
     reresolve()     S3 again after a doctor corrects a medicine name
     pack_reader     stage 6, reading a photographed pack
@@ -15,11 +17,16 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Optional
+import threading
+import traceback
+from typing import List, Optional, Sequence, Union
 
-from ingest.normalise import normalise
+from fastapi import HTTPException
+
+from ingest.normalise import NormalisedImage, normalise
 from schemas import Outcome, ResolvedMedicine, VerificationTier
-from vlm.page_reader import CachedPageReader, build_reader, resolve_reader_kind
+from vlm.client import describe_error
+from vlm.page_reader import ReadResult, build_reader, read_many, resolve_reader_kind
 from vlm.prompts import PROMPT_VERSION
 from vlm.vocab import _describe, _describe_ingredient, load_config, resolve_page
 
@@ -29,41 +36,104 @@ reader = None
 checker = None
 pack_reader = None
 reader_kind = "unset"
+# Result of the free key check run at startup: not_run | ok | auth_error |
+# model_unavailable | unreachable. Reported by /api/health.
+reader_check = "not_run"
 
 
 def init() -> None:
-    global reader, checker, pack_reader, reader_kind
+    global reader, checker, pack_reader, reader_kind, reader_check
     from drug_interaction.interaction_inference import InteractionChecker
     from vlm.pack_reader import build_pack_reader
 
     reader_kind = resolve_reader_kind(READER_SETTING)
-    reader = build_reader(reader_kind)
-    pack_reader = build_pack_reader(reader_kind if reader_kind in ("claude", "mock") else "mock")
+    caller = None
+    if reader_kind == "claude":
+        from vlm.client import ClaudeCaller
+
+        caller = ClaudeCaller()   # one client: shared retries, concurrency and spend rules
+    reader = build_reader(reader_kind, caller=caller)
+    pack_reader = build_pack_reader(reader_kind if reader_kind in ("claude", "mock") else "mock",
+                                    caller=caller)
     checker = InteractionChecker()
+    if medicine_data() == "missing":
+        from normalise.india_medicines import DATA_DIR
+
+        print(f"[API] WARNING: the medicine CSVs are not in {DATA_DIR}. Brand matching cannot run, "
+              f"so every upload will fail until they are added (README §9).", flush=True)
     if reader_kind.startswith("mock"):
+        reader_check = "not_run"
         print("[API] READER is the MOCK: every page reads as the same demo prescription. "
               "Add ANTHROPIC_API_KEY to .env and restart to read real pages.", flush=True)
+    elif caller is not None:
+        # Tell the operator NOW whether the key works, not at the first upload.
+        # One free metadata call, off the startup path so a slow network never
+        # delays the server.
+        def probe() -> None:
+            global reader_check
+            reader_check = caller.check_access(reader.model)
+            if reader_check == "ok":
+                print(f"[API] API key accepted; {reader.model} is available.", flush=True)
+            else:
+                print(f"[API] WARNING: reader check failed ({reader_check}). Page reads will "
+                      f"fail until ANTHROPIC_API_KEY and the model are right.", flush=True)
+
+        threading.Thread(target=probe, daemon=True).start()
+
+
+def medicine_data() -> str:
+    """ok | missing. The two CSVs S2/S3 need are gitignored, so a fresh clone
+    does not have them; say so at startup rather than at the first upload."""
+    from normalise.india_medicines import MASTER_CSV, NLEM_FORMULATIONS_CSV
+
+    return "ok" if MASTER_CSV.exists() and NLEM_FORMULATIONS_CSV.exists() else "missing"
+
+
+def reader_http_error(exc: BaseException) -> HTTPException:
+    """A failed read as an HTTP error whose message is safe to show the user.
+    The full exception goes to the server log, never to the browser."""
+    status, message = describe_error(exc)
+    print(f"[READER] {type(exc).__name__}: {exc}", flush=True)
+    if status == 502 and not isinstance(exc, (RuntimeError, OSError)):
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+    headers = {"Retry-After": "60"} if status == 503 else None
+    return HTTPException(status, message, headers=headers)
 
 
 def is_mock() -> bool:
     return reader_kind.startswith("mock")
 
 
-def read_page(contents: bytes):
-    """S0-S3. Returns (page, resolved medicine dicts, normalised image, provenance)."""
-    norm = normalise(contents)                 # S0
-    page = reader.read(norm)                   # S1
-    meds = resolve_page(page)                  # S2 + S3
-    inner = getattr(reader, "inner", reader)
-    cost = getattr(inner, "last_cost", None)
-    provenance = dict(
-        model=reader.model, prompt_version=PROMPT_VERSION,
-        effort=getattr(inner, "effort", None),
-        raw_response=json.dumps(getattr(inner, "last_raw_response", None)),
-        cost_usd=cost.usd if cost else 0.0,
-        from_cache=isinstance(reader, CachedPageReader) and cost is None,
+def _provenance(r: ReadResult) -> dict:
+    """Fields 1 and 2 of models.py §16.3, taken from THIS read's own result."""
+    return dict(
+        model=r.model, prompt_version=PROMPT_VERSION, effort=r.effort,
+        raw_response=json.dumps(r.raw_response),
+        cost_usd=r.cost_usd, from_cache=r.from_cache,
     )
-    return page, meds, norm, provenance
+
+
+def read_page(source: Union[bytes, NormalisedImage]):
+    """S0-S3. Returns (page, resolved medicine dicts, normalised image, provenance)."""
+    norm = source if isinstance(source, NormalisedImage) else normalise(source)   # S0
+    result = reader.read_detailed(norm)                                           # S1
+    return result.page, resolve_page(result.page), norm, _provenance(result)      # S2 + S3
+
+
+def read_pages(sources: Sequence[Union[bytes, NormalisedImage]]) -> list:
+    """S0-S3 for several pages, S1 in parallel. One entry per input, in order:
+    either the read_page() tuple or the exception that page raised."""
+    norms = [s if isinstance(s, NormalisedImage) else normalise(s) for s in sources]
+    out = []
+    for norm, result in zip(norms, read_many(reader, norms)):
+        if isinstance(result, Exception):
+            out.append(result)
+            continue
+        try:
+            out.append((result.page, resolve_page(result.page), norm, _provenance(result)))
+        except Exception as exc:        # e.g. the medicine dataset is missing
+            out.append(exc)
+    return out
 
 
 def med_dict(i: int, m: ResolvedMedicine) -> dict:

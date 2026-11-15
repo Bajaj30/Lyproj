@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-export const useAppStore = create((set, get) => ({
+export const useAppStore = create((set) => ({
   // Current prescription result
   currentResult: null,
   setCurrentResult: (result) => set({ currentResult: result }),

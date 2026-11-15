@@ -6,6 +6,7 @@ Doctor API for Workflow.md stages 1–3: consultations, pages, review, finalise.
     GET    /api/consultations/{id}                     working copy, every page
     PATCH  /api/consultations/{id}                     patient, clinic, diagnosis, flags
     POST   /api/consultations/{id}/pages               upload a page: S0–S4 run
+    POST   /api/consultations/{id}/pages/batch         several pages, read in parallel
     DELETE /api/consultations/{id}/pages/{page_id}     only before the first finalise
     POST   /api/consultations/{id}/medicines           add a medicine the reader missed
     POST   /api/prescriptions/{page_id}/medicines/{i}/remove    strike an invented line
@@ -24,6 +25,13 @@ Rules this module keeps:
   * EVERY EDIT IS STILL A CORRECTION ROW (models.py §16.3): additions as
     `missed`, removals as `hallucinated`, a diagnosis edit as a page-level field.
   * A doctor sees only their own consultations. Anything else is a 404.
+  * A PAGE IS NEVER PAID FOR TWICE, AND NEVER COUNTED TWICE
+    (docs/API_IMPLEMENTATION.md §1). The same image again in one prescription
+    is refused before any reader call. Two pages that READ identically are
+    flagged, and finalising past them needs the doctor to say so: a duplicated
+    page is every medicine prescribed, and dispensed, twice.
+  * READS RUN OFF THE EVENT LOOP. A real read takes 10–30 s; awaited inline it
+    froze the whole server for every other user.
 """
 
 from __future__ import annotations
@@ -35,15 +43,18 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 import pipeline
-from auth import Role, User, require_roles
+from auth import Role, User, require_vetted
 from auth.models import aware
-from auth.routes import _event, norm_phone
+from auth.routes import _event, _throttle, norm_phone
 from config.database import get_db
+from config.settings import settings
+from ingest.normalise import normalise
 from models import (
     Consultation,
     ConsultationStatus,
@@ -66,7 +77,8 @@ from views import (
 )
 
 router = APIRouter(tags=["consultations"])
-doctor_only = require_roles(Role.DOCTOR)
+# Signed in as a doctor AND approved by an administrator (admin.py).
+doctor_only = require_vetted(Role.DOCTOR)
 
 MAX_PAGES = 10
 UNRESOLVED = ("ambiguous", "illegible", "unmatched")
@@ -111,6 +123,8 @@ class RemoveIn(BaseModel):
 class FinaliseIn(BaseModel):
     acknowledge_unresolved: bool = Field(
         False, description="Finalise even though some lines are still unreadable or unmatched")
+    acknowledge_duplicates: bool = Field(
+        False, description="Finalise even though two pages read identically")
     change_note: Optional[str] = Field(None, max_length=300, description="Shown as 'what changed' on a revision")
 
 
@@ -120,6 +134,10 @@ class DoctorOut(BaseModel):
     speciality: Optional[str] = None
     clinic_address: Optional[str] = None
     registration_no: Optional[str] = None
+    # True when an administrator had approved this account's registration
+    # details. Frozen into each finalised version, so the verify page reports
+    # what was true when the prescription was issued.
+    vetted: bool = False
 
 
 class VersionSummary(BaseModel):
@@ -127,6 +145,25 @@ class VersionSummary(BaseModel):
     finalised_at: str
     verification_id: str
     change_note: Optional[str] = None
+
+
+class DuplicateNote(BaseModel):
+    """`same_reading`: two pages of THIS prescription read identically (blocks
+    finalise until acknowledged). `same_image_elsewhere`: this exact photo is
+    also in another of the doctor's consultations (information only)."""
+
+    kind: str
+    page_no: int
+    other_page_no: Optional[int] = None
+    other_consultation_id: Optional[str] = None
+    message: str
+
+
+class PageUploadResult(BaseModel):
+    filename: str
+    status: str                 # added | duplicate | failed
+    page_no: Optional[int] = None
+    detail: Optional[str] = None
 
 
 class ConsultationOut(BaseModel):
@@ -147,8 +184,14 @@ class ConsultationOut(BaseModel):
     medicines: List[MedicineOut] = []
     interactions: InteractionOutcome
     unresolved: List[str] = []
+    duplicates: List[DuplicateNote] = []
     versions: List[VersionSummary] = []
     reader_is_mock: bool = False
+
+
+class BatchUploadOut(BaseModel):
+    consultation: ConsultationOut
+    results: List[PageUploadResult]
 
 
 class ConsultationSummary(BaseModel):
@@ -175,7 +218,8 @@ def doctor_details(user: Optional[User], clinic: Optional[str] = None) -> Option
     p = json.loads(user.profile_json or "{}")
     return DoctorOut(id=user.id, name=user.full_name, speciality=p.get("speciality"),
                      clinic_address=clinic or p.get("clinic_address"),
-                     registration_no=p.get("registration_no"))
+                     registration_no=p.get("registration_no"),
+                     vetted=user.vetting_status == "approved")
 
 
 def owned(db: Session, user: User, cid: str) -> Consultation:
@@ -210,6 +254,55 @@ def _label(m: dict) -> str:
 def unresolved(meds: List[dict]) -> List[str]:
     return [f"{_label(m)} (page {m.get('page_no')}): {m['outcome']}"
             for m in meds if not m.get("removed") and m.get("outcome") in UNRESOLVED]
+
+
+def _reading_key(rx: Prescription) -> Optional[tuple]:
+    """What the reader saw on a page, as a comparable value. None for a page
+    with no medicine lines: two blank pages are not "the same prescription"."""
+    lines = json.loads(rx.page_read_json).get("medicines") or []
+    if not lines:
+        return None
+    norm = lambda v: " ".join(str(v or "").casefold().split())  # noqa: E731
+    return tuple((norm(m.get("drug_token") or m.get("raw_text")), norm(m.get("dosage")),
+                  norm(m.get("frequency")), norm(m.get("duration"))) for m in lines)
+
+
+def _has_live_medicine(rx: Prescription) -> bool:
+    return any(not m.get("removed") for m in json.loads(rx.resolved_json))
+
+
+def duplicate_notes(db: Session, c: Consultation) -> List[DuplicateNote]:
+    notes: List[DuplicateNote] = []
+    seen: dict = {}
+    for rx in c.pages:
+        key = _reading_key(rx)
+        if key is None or not _has_live_medicine(rx):
+            continue        # a page whose lines were all struck duplicates nothing
+        if key in seen:
+            notes.append(DuplicateNote(
+                kind="same_reading", page_no=rx.page_no, other_page_no=seen[key],
+                message=f"Page {rx.page_no} reads the same as page {seen[key]}. If it is a second "
+                        f"photo of the same page, remove it: otherwise every medicine on it is "
+                        f"prescribed twice."))
+        else:
+            seen[key] = rx.page_no
+    if c.doctor_id:
+        hashes = {rx.image_sha256: rx for rx in c.pages if rx.image_sha256}
+        if hashes:
+            # Only ever the SAME doctor's records: this must not tell one doctor
+            # that another has seen the same patient.
+            others = (db.query(Prescription).join(Consultation, Prescription.consultation_id == Consultation.id)
+                      .filter(Consultation.doctor_id == c.doctor_id, Consultation.id != c.id,
+                              Prescription.image_sha256.in_(list(hashes))).all())
+            for o in others:
+                mine = hashes[o.image_sha256]
+                who = o.consultation.patient_name or "an unnamed patient"
+                notes.append(DuplicateNote(
+                    kind="same_image_elsewhere", page_no=mine.page_no, other_page_no=o.page_no,
+                    other_consultation_id=o.consultation_id,
+                    message=f"Page {mine.page_no} is the same photo as page {o.page_no} of your "
+                            f"consultation for {who} on {aware(o.created_at):%d %b %Y}."))
+    return notes
 
 
 def recompute(db: Session, c: Consultation) -> dict:
@@ -259,6 +352,7 @@ def consultation_out(db: Session, c: Consultation) -> ConsultationOut:
         medicines=[MedicineOut(**m) for m in meds],
         interactions=interaction_out(latest_result(db, c)),
         unresolved=unresolved(meds),
+        duplicates=duplicate_notes(db, c),
         versions=[VersionSummary(version=v.version, finalised_at=aware(v.finalised_at).isoformat(),
                                  verification_id=v.verification_id, change_note=v.change_note)
                   for v in c.versions],
@@ -387,27 +481,14 @@ def update_consultation(cid: str, body: ConsultationPatch, request: Request,
     return consultation_out(db, c)
 
 
-@router.post("/api/consultations/{cid}/pages", response_model=ConsultationOut)
-async def upload_page(cid: str, request: Request, image: UploadFile = File(...),
-                      db: Session = Depends(get_db), user: User = Depends(doctor_only)):
-    c = owned(db, user, cid)
-    if len(c.pages) >= MAX_PAGES:
-        raise HTTPException(422, f"A prescription can have at most {MAX_PAGES} pages.")
-    rx = await ingest_page(db, image, c)
-    _event(db, request, "page_uploaded", user.id, f"{c.id} page {rx.page_no}")
-    db.commit()
-    db.refresh(c)
-    return consultation_out(db, c)
-
-
-async def ingest_page(db: Session, image: UploadFile, c: Consultation) -> Prescription:
-    """Store the image, run S0–S4, attach the page, recheck the whole consultation."""
+async def _take_upload(image: UploadFile) -> tuple:
+    """(bytes, stored extension). The extension comes from what the bytes ARE,
+    never from the client's filename (the stored-XSS fix)."""
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(400, "File must be an image (jpg, png, ...)")
     contents = await image.read()
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(413, "That image is over 10 MB.")
-    # The stored extension comes from what the bytes ARE, never the filename.
     try:
         import io
 
@@ -419,15 +500,35 @@ async def ingest_page(db: Session, image: UploadFile, c: Consultation) -> Prescr
     ext = PIL_FORMATS.get(fmt or "")
     if not ext:
         raise HTTPException(400, "That file is not a supported image (JPG, PNG, WEBP, GIF, BMP or TIFF).")
+    return contents, ext
+
+
+def _normalised(contents: bytes):
+    try:
+        return normalise(contents)          # S0: also the page's identity (sha256)
+    except Exception as exc:
+        raise HTTPException(400, "That image could not be opened. Try another photo.") from exc
+
+
+def _same_image(c: Consultation, sha: str) -> Optional[Prescription]:
+    return next((rx for rx in c.pages if rx.image_sha256 == sha), None)
+
+
+def _charge_quota(user: Optional[User], pages: int) -> None:
+    """A per-doctor daily ceiling on reader calls, on top of the global spend
+    cap: one stolen or careless account must not be able to drain the budget."""
+    limit = settings.PAGE_READS_PER_DOCTOR_PER_DAY
+    if not user or limit <= 0:
+        return
+    for _ in range(pages):
+        _throttle("page_reads_user", user.id, limit, 24 * 60 * 60)
+
+
+def _attach(db: Session, c: Consultation, contents: bytes, ext: str, read: tuple) -> Prescription:
+    page, meds, norm, prov = read
     img_id = str(uuid.uuid4())
     img_path = UPLOAD_DIR / f"{img_id}.{ext}"
     img_path.write_bytes(contents)
-    try:
-        page, meds, norm, prov = pipeline.read_page(contents)
-    except Exception as exc:  # spend cap, bad key, API outage, unreadable file
-        img_path.unlink(missing_ok=True)
-        raise HTTPException(502, f"Reader failed: {exc}") from exc
-
     rx = Prescription(
         id=img_id, image_path=str(img_path), image_sha256=norm.sha256,
         page_read_json=page.model_dump_json(),
@@ -444,9 +545,96 @@ async def ingest_page(db: Session, image: UploadFile, c: Consultation) -> Prescr
     if not c.patient_name and page.patient_name:
         c.patient_name = page.patient_name
     db.flush()
+    return rx
+
+
+async def ingest_page(db: Session, image: UploadFile, c: Consultation,
+                      user: Optional[User] = None) -> Prescription:
+    """One page: store the image, run S0–S4, attach it, recheck the consultation."""
+    contents, ext = await _take_upload(image)
+    norm = await run_in_threadpool(_normalised, contents)
+    dup = _same_image(c, norm.sha256)
+    if dup:
+        # Refused before any reader call: nothing is spent, nothing is doubled.
+        raise HTTPException(409, f"This image is already page {dup.page_no} of this prescription.")
+    _charge_quota(user, 1)
+    try:
+        read = await run_in_threadpool(pipeline.read_page, norm)
+    except HTTPException:
+        raise
+    except Exception as exc:  # spend cap, bad key, API outage, refusal, missing data
+        raise pipeline.reader_http_error(exc) from exc
+    rx = _attach(db, c, contents, ext, read)
     recompute(db, c)
     mark_changed(c)
     return rx
+
+
+@router.post("/api/consultations/{cid}/pages", response_model=ConsultationOut)
+async def upload_page(cid: str, request: Request, image: UploadFile = File(...),
+                      db: Session = Depends(get_db), user: User = Depends(doctor_only)):
+    c = owned(db, user, cid)
+    if len(c.pages) >= MAX_PAGES:
+        raise HTTPException(422, f"A prescription can have at most {MAX_PAGES} pages.")
+    rx = await ingest_page(db, image, c, user)
+    _event(db, request, "page_uploaded", user.id, f"{c.id} page {rx.page_no}")
+    db.commit()
+    db.refresh(c)
+    return consultation_out(db, c)
+
+
+@router.post("/api/consultations/{cid}/pages/batch", response_model=BatchUploadOut)
+async def upload_pages(cid: str, request: Request, images: List[UploadFile] = File(...),
+                       db: Session = Depends(get_db), user: User = Depends(doctor_only)):
+    """Several pages in one request. Exact duplicates are dropped before the
+    reader is called, the rest are read in parallel, and the interaction check
+    runs once at the end. Each file gets its own result: a page that fails does
+    not lose the ones that were read."""
+    c = owned(db, user, cid)
+    if len(c.pages) + len(images) > MAX_PAGES:
+        raise HTTPException(422, f"A prescription can have at most {MAX_PAGES} pages; "
+                                 f"this one has {len(c.pages)}.")
+    results: List[Optional[PageUploadResult]] = [None] * len(images)
+    todo = []                       # (index, contents, ext, normalised image)
+    in_batch: dict = {}             # sha -> filename of the first copy in this upload
+    for i, image in enumerate(images):
+        name = (image.filename or f"page {i + 1}")[:120]
+        try:
+            contents, ext = await _take_upload(image)
+            norm = await run_in_threadpool(_normalised, contents)
+        except HTTPException as exc:
+            results[i] = PageUploadResult(filename=name, status="failed", detail=str(exc.detail))
+            continue
+        existing = _same_image(c, norm.sha256)
+        if existing:
+            results[i] = PageUploadResult(filename=name, status="duplicate", page_no=existing.page_no,
+                                          detail=f"Already page {existing.page_no} of this prescription.")
+        elif norm.sha256 in in_batch:
+            results[i] = PageUploadResult(filename=name, status="duplicate",
+                                          detail=f"The same image as {in_batch[norm.sha256]}.")
+        else:
+            in_batch[norm.sha256] = name
+            todo.append((i, name, contents, ext, norm))
+
+    if todo:
+        _charge_quota(user, len(todo))
+        reads = await run_in_threadpool(pipeline.read_pages, [t[4] for t in todo])
+        added = 0
+        for (i, name, contents, ext, _norm), read in zip(todo, reads):
+            if isinstance(read, Exception):
+                err = pipeline.reader_http_error(read)
+                results[i] = PageUploadResult(filename=name, status="failed", detail=str(err.detail))
+                continue
+            rx = _attach(db, c, contents, ext, read)
+            results[i] = PageUploadResult(filename=name, status="added", page_no=rx.page_no)
+            added += 1
+        if added:
+            recompute(db, c)        # once, across every page
+            mark_changed(c)
+            _event(db, request, "page_uploaded", user.id, f"{c.id} +{added} page(s)")
+            db.commit()
+            db.refresh(c)
+    return BatchUploadOut(consultation=consultation_out(db, c), results=[r for r in results if r])
 
 
 @router.delete("/api/consultations/{cid}/pages/{pid}", response_model=ConsultationOut)
@@ -566,6 +754,11 @@ def finalise(cid: str, body: FinaliseIn, request: Request, db: Session = Depends
     if left and not body.acknowledge_unresolved:
         raise HTTPException(422, "Some lines are still unresolved: " + "; ".join(left)
                             + ". Correct or remove them, or confirm you want to finalise anyway.")
+
+    twice = [n.message for n in duplicate_notes(db, c) if n.kind == "same_reading"]
+    if twice and not body.acknowledge_duplicates:
+        raise HTTPException(422, "Two pages read identically: " + " ".join(twice)
+                            + " Remove the duplicate, or confirm both pages are meant.")
 
     now = _now()
     version = c.current_version + 1

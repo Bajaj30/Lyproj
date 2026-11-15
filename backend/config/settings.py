@@ -60,6 +60,15 @@ class Settings:
     SHARE_REDEEM_MINUTES: int = int(os.getenv("SHARE_REDEEM_MINUTES", "5"))
     SHARE_WINDOW_MINUTES: int = int(os.getenv("SHARE_WINDOW_MINUTES", "15"))
 
+    # Doctors and pharmacies must be approved by an administrator before they
+    # can issue or open a prescription (Workflow.md §10 Q5). Turn off ONLY for
+    # local development; with it off, anyone who registers as a doctor is one.
+    REQUIRE_VETTING: bool = os.getenv("REQUIRE_VETTING", "true").lower() == "true"
+
+    # Reader calls one doctor account may make in 24 hours (0 = no limit). A
+    # second line of defence behind the global spend cap.
+    PAGE_READS_PER_DOCTOR_PER_DAY: int = int(os.getenv("PAGE_READS_PER_DOCTOR_PER_DAY", "200"))
+
     # Where the site is reachable; the QR on a prescription PDF points here.
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 

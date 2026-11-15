@@ -162,6 +162,9 @@ export default function PharmacyGrantPage() {
               <p className="text-sm text-ink-600">{g.doctor.speciality}</p>
               <p className="text-sm text-ink-600">{g.doctor.clinic_address}</p>
               <p className="mt-1 text-sm">Reg. no. <span className="data">{g.doctor.registration_no || <em className="text-amber-700">not given</em>}</span></p>
+              <p className="mt-1 text-xs text-ink-500">
+                {g.doctor.vetted ? 'Registration details reviewed by a PrescriptAI administrator.' : 'Registration number as declared by the doctor; not reviewed.'}
+              </p>
               {g.diagnosis && <p className="mt-2 text-sm"><span className="text-ink-500">Diagnosis:</span> {g.diagnosis}</p>}
             </section>
           )}

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import {
   AlertTriangle, CheckCircle2, Loader2, ShieldAlert, Plus, FilePlus2, Trash2, History, Stethoscope,
-  UserRound, Lock, BadgeCheck, Save,
+  UserRound, Lock, BadgeCheck, Save, Copy,
 } from 'lucide-react'
 import MedicineCard from '../components/MedicineCard'
 import DemoReaderBanner from '../components/DemoReaderBanner'
@@ -107,6 +107,23 @@ export default function ConsultationPage() {
           {needsAttention} line{needsAttention > 1 ? 's need' : ' needs'} your confirmation.
         </Banner>
       )}
+      {c.duplicates.filter((d) => d.kind === 'same_reading').map((d) => (
+        <Banner key={`dup-${d.page_no}`} tone="error">
+          <Copy className="mr-1 inline h-4 w-4" />{d.message}
+          {c.current_version === 0 && (
+            <button type="button" disabled={!!busy} className="ml-2 font-semibold underline"
+                    onClick={() => { const p = c.pages.find((x) => x.page_no === d.page_no); if (p) run('page', () => deletePage(c.id, p.id)) }}>
+              Delete page {d.page_no}
+            </button>
+          )}
+        </Banner>
+      ))}
+      {c.duplicates.filter((d) => d.kind === 'same_image_elsewhere').map((d) => (
+        <Banner key={`same-${d.page_no}-${d.other_consultation_id}`} tone="info">
+          {d.message}{' '}
+          <Link to={`/consultations/${d.other_consultation_id}`} className="font-semibold underline">Open it</Link>
+        </Banner>
+      ))}
       {error && <Banner tone="error">{error}</Banner>}
       {notice && <Banner tone="info">{notice}</Banner>}
 
@@ -298,12 +315,15 @@ function DiagnosisPanel({ c, busy, onSave }) {
 
 function FinalisePanel({ c, busy, onFinalise }) {
   const [ack, setAck] = useState(false)
+  const [ackDup, setAckDup] = useState(false)
   const [note, setNote] = useState('')
+  const twice = c.duplicates.filter((d) => d.kind === 'same_reading')
   const unchanged = c.status === 'finalised'
   const ambiguous = c.medicines.filter((m) => !m.removed && m.outcome === 'ambiguous').length
   const missing = !c.patient_name || !c.patient_phone
   const others = c.unresolved.length - ambiguous
   const blocked = unchanged || !c.pages.length || ambiguous > 0 || missing || (others > 0 && !ack)
+    || (twice.length > 0 && !ackDup)
   const revision = c.current_version > 0
   return (
     <section className="card border-care-200">
@@ -328,12 +348,23 @@ function FinalisePanel({ c, busy, onFinalise }) {
             </label>
           </li>
         )}
+        {twice.length > 0 && (
+          <li>
+            <p className="font-medium text-vital-800">
+              {twice.map((d) => `Page ${d.page_no} reads the same as page ${d.other_page_no}.`).join(' ')}
+            </p>
+            <label className="mt-1 flex items-start gap-2 text-xs text-ink-700">
+              <input type="checkbox" className="mt-0.5 rounded border-ink-300 text-care-700" checked={ackDup} onChange={(e) => setAckDup(e.target.checked)} />
+              These are different pages and every medicine on both is meant. Finalise with both.
+            </label>
+          </li>
+        )}
       </ul>
       {revision && !unchanged && (
         <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="What changed? (shown to the patient)"
                className="input-field mt-3 py-2 text-sm" maxLength={300} />
       )}
-      <button type="button" disabled={blocked || busy} onClick={() => onFinalise({ acknowledgeUnresolved: ack, changeNote: note })}
+      <button type="button" disabled={blocked || busy} onClick={() => onFinalise({ acknowledgeUnresolved: ack, acknowledgeDuplicates: ackDup, changeNote: note })}
               className="btn-confirm mt-3">
         {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
         {unchanged ? `Version ${c.current_version} is current` : revision ? 'Finalise revision' : 'Finalise and send to patient'}

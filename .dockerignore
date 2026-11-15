@@ -12,5 +12,6 @@ ml_pipeline/.cache/
 .git/
 .vscode/
 VLM_CHECK/
-pharmacy_dashboard/
+tests/
+.venv/
 docs/

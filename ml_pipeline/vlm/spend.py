@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,11 +35,13 @@ from env import load_env  # noqa: E402
 # and the default applies. That is a budget bug, so it happens at import.
 load_env()
 
-LEDGER_PATH = _ML_DIR / ".cache" / "spend_ledger.json"
+LEDGER_PATH = Path(os.environ.get("PRESCRIPTAI_CACHE_DIR") or _ML_DIR / ".cache") / "spend_ledger.json"
 
 # $ per 1M tokens: (input, output)
 PRICES: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
+    # A refusal fallback (vlm/client.py) can be answered by this model.
+    "claude-opus-4-8": (5.0, 25.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-haiku-4-5": (1.0, 5.0),
 }
@@ -115,6 +118,8 @@ class SpendGuard:
             else float(os.environ.get("PRESCRIPTAI_SPEND_CAP", DEFAULT_CAP_USD))
         )
         self._lock = threading.Lock()
+        # Estimated cost of calls that have started but not yet been recorded.
+        self._reserved = 0.0
 
     def _read(self) -> list[dict]:
         if not self.ledger_path.exists():
@@ -143,6 +148,30 @@ class SpendGuard:
                 f"Raise PRESCRIPTAI_SPEND_CAP deliberately, or clear "
                 f"{self.ledger_path}."
             )
+
+    @contextmanager
+    def reserve(self, estimated_usd: float = 0.05):
+        """Hold `estimated_usd` against the cap for the length of one call.
+
+        `check_before_call` alone is not enough once pages are read in parallel:
+        N calls would each see the same total, each pass, and overshoot the cap
+        together. A reservation counts the calls already in flight. It is
+        per-process; run one API worker per ledger (docs/API_IMPLEMENTATION.md).
+        """
+        with self._lock:
+            total = self.total_usd()
+            if total + self._reserved + estimated_usd > self.cap_usd:
+                raise SpendCapExceeded(
+                    f"Spend cap reached: ${total:.2f} spent and ${self._reserved:.2f} in flight "
+                    f"of ${self.cap_usd:.2f}; this call is estimated at ${estimated_usd:.4f}. "
+                    f"Raise PRESCRIPTAI_SPEND_CAP deliberately, or clear {self.ledger_path}."
+                )
+            self._reserved += estimated_usd
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._reserved = max(0.0, self._reserved - estimated_usd)
 
     def record(self, cost: CallCost, tag: str = "") -> CallCost:
         with self._lock:

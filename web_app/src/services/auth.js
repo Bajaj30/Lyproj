@@ -41,6 +41,6 @@ export const revokeSession = async (id) => (await api.delete(`/api/auth/sessions
 export const revokeOtherSessions = () => post('/api/auth/sessions/revoke-others')
 
 /** Where each stakeholder lands after signing in (Workflow.md §2). */
-export const ROLE_HOME = { doctor: '/upload', patient: '/patient', chemist: '/pharmacy' }
+export const ROLE_HOME = { doctor: '/upload', patient: '/patient', chemist: '/pharmacy', admin: '/admin' }
 
-export const ROLE_LABEL = { doctor: 'Doctor', patient: 'Patient', chemist: 'Pharmacy' }
+export const ROLE_LABEL = { doctor: 'Doctor', patient: 'Patient', chemist: 'Pharmacy', admin: 'Administrator' }

@@ -1,5 +1,10 @@
 # Updates since the login pages
 
+> **Update (Session 10, 16 Nov 2026):** open items 2, 7 and 8 are addressed too
+> (real SMS built but untested live; vetting; encryption and shared rate limits).
+> See [§9](#9-session-10-production-gaps-and-api-calling) and
+> [`API_IMPLEMENTATION.md`](API_IMPLEMENTATION.md).
+>
 > **Update (Session 9, 14 Nov 2026):** the stored-XSS hole in §6 is **fixed**, and
 > open items 1 and 3–6 below are done. See [§8](#8-session-9-the-rest-of-the-workflow)
 > and [`claude.md`](../claude.md), Session 9.
@@ -230,13 +235,13 @@ Recommendations for when the mock reader is switched off. Prices are from OpenRo
 | # | Item |
 |---|---|
 | 1 | ~~Fix the stored-XSS upload hole (§6)~~ **done, Session 9** |
-| 2 | Real SMS provider (phone codes are emailed for now) |
+| 2 | ~~Real SMS provider~~ **built, Session 10** (Twilio or a webhook). It has never sent a real text; until `SMS_DELIVERY` is changed, codes still go by email |
 | 3 | ~~Silent edits after confirming~~ **done:** immutable versions, labelled revisions |
 | 4 | ~~One page per prescription~~ **done:** multi-page consultations |
 | 5 | ~~No QR on the PDF~~ **done:** QR → public `/check/<id>` |
 | 6 | ~~Pharmacy placeholders~~ **done:** stages 5–7 built |
-| 7 | Doctor and pharmacy sign-ups are not vetted |
-| 8 | Encrypt `mfa_secret`; move rate limiting to Redis before running several workers |
+| 7 | ~~Sign-ups are not vetted~~ **done, Session 10:** an administrator approves every doctor and pharmacy |
+| 8 | ~~Encrypt `mfa_secret`; shared rate limiting~~ **done, Session 10:** encrypted at rest (key in the environment, not yet a KMS); limits live in the database |
 
 ---
 
@@ -259,3 +264,27 @@ Every Workflow.md stage is now built. It runs on the mock reader until an API ke
 Checks: 23 dispensing unit checks, 98 API checks, 38 browser checks, all passing on the
 mock reader and a labelled test fixture (the real medicine CSVs are not in this
 checkout). Not yet verified: the Claude pack reader live, and the Docker image rebuild.
+
+---
+
+## 9. Session 10: production gaps and API calling
+
+The full account is [`API_IMPLEMENTATION.md`](API_IMPLEMENTATION.md) and
+[`claude.md`](../claude.md), Session 10.
+
+| Area | What changed |
+|---|---|
+| **API calling** | Every call goes through one module. A multi-page upload is one request, read in parallel. A page is never paid for twice: exact repeats cost nothing, and two pages that read the same are flagged before finalising. Refusals and cut-off replies are failures, never empty prescriptions |
+| **Vetting** | Doctors and pharmacies start pending; an administrator (created only with `manage.py create-admin`) approves them at `/admin` |
+| **Secrets** | Two-step secrets are encrypted in the database |
+| **Rate limits** | Stored in the database: shared by every worker, kept across restarts |
+| **SMS** | Twilio or a generic webhook. Built, never sent a real text |
+| **Migrations** | Alembic; an existing database is adopted without data loss |
+| **Docker** | The server runs as an unprivileged user; `docker-compose.prod.yml` adds HTTPS |
+| **Tests** | In the repo: `python tests/run.py` |
+
+**After pulling this, on an existing deployment:** every doctor and pharmacy account
+becomes pending. Create an administrator and approve them; their data is untouched.
+
+Still not verified: anything against the live API since the reader was rewritten, a
+real text message, and a real domain certificate.

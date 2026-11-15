@@ -15,14 +15,26 @@ The cache is not an optimisation, it is what makes the testing budget work:
 at a 70% hit rate the phase costs $7.38 instead of $24.58 (§14.2). Most
 development re-runs exercise S2-S4 and the UI against an UNCHANGED VLM output;
 those must cost nothing.
+
+Every reader returns a `ReadResult` from `read_detailed()`: the page PLUS the
+raw reply, usage, cost and which model answered. Earlier the reader kept "the
+last call's" metadata on itself, which is wrong the moment two pages are read
+at once (page A stored with page B's raw reply), and was already wrong for a
+cache hit (stored with the PREVIOUS miss's raw reply and cost). `read()` stays
+as a thin wrapper for the CLI. `read_many()` reads several pages in parallel.
+See docs/API_IMPLEMENTATION.md.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol, Union, runtime_checkable
+from typing import Dict, List, Optional, Protocol, Sequence, Union, runtime_checkable
 
 from PIL import Image
 
@@ -39,20 +51,37 @@ from vlm.prompts import (  # noqa: E402
     USER_TURN_TEXT,
     prompt_fingerprint,
 )
-from vlm.spend import CallCost, get_guard, price_call  # noqa: E402
+from vlm.spend import get_guard  # noqa: E402
 
 DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "medium"  # §6.5 — effort is the dominant cost lever
 MAX_TOKENS = 16000  # never lower this to save money: a truncated PageRead is a failed read
 
 _ML_DIR = Path(__file__).resolve().parent.parent
-CACHE_DIR = _ML_DIR / ".cache" / "vlm"
+# PRESCRIPTAI_CACHE_DIR moves the read cache and the spend ledger together
+# (a mounted volume in production; a temp directory under test).
+CACHE_DIR = Path(os.environ.get("PRESCRIPTAI_CACHE_DIR") or _ML_DIR / ".cache") / "vlm"
 
 PageSource = Union[str, Path, bytes, Image.Image, NormalisedImage]
 
 
 def _as_normalised(source: PageSource) -> NormalisedImage:
     return source if isinstance(source, NormalisedImage) else normalise(source)
+
+
+@dataclass
+class ReadResult:
+    """One page read, with everything the correction log must capture at write
+    time (models.py §16.3). Self-contained: safe to produce concurrently."""
+
+    page: PageRead
+    image_sha256: str
+    model: str                         # the model that ANSWERED (after any fallback)
+    effort: Optional[str] = None
+    raw_response: Optional[dict] = None
+    usage: Optional[dict] = None
+    cost_usd: float = 0.0              # 0 for a cache hit: nothing was spent
+    from_cache: bool = False
 
 
 @runtime_checkable
@@ -62,6 +91,8 @@ class PageReader(Protocol):
     model: str
 
     def read(self, source: PageSource) -> PageRead: ...
+
+    def read_detailed(self, source: PageSource) -> ReadResult: ...
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,8 +117,13 @@ class MockPageReader:
         self.model = f"mock-{document_type.replace('_', '-')}"
 
     def read(self, source: PageSource) -> PageRead:
-        _as_normalised(source)  # exercise the real S0 path so bugs surface here too
+        return self.read_detailed(source).page
 
+    def read_detailed(self, source: PageSource) -> ReadResult:
+        img = _as_normalised(source)  # exercise the real S0 path so bugs surface here too
+        return ReadResult(page=self._page(), image_sha256=img.sha256, model=self.model)
+
+    def _page(self) -> PageRead:
         if self.document_type == "not_a_prescription":
             # The hard-negative case: a clinical note with no medications.
             return PageRead(
@@ -162,6 +198,15 @@ class MockPageReader:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _owner_only(path: Path, directory: bool = False) -> None:
+    """chmod 700 / 600. Best effort: a filesystem without POSIX modes (Windows)
+    is left as it is rather than failing the read."""
+    try:
+        os.chmod(path, 0o700 if directory else 0o600)
+    except OSError:
+        pass
+
+
 class CachedPageReader:
     """On-disk response cache around any PageReader.
 
@@ -180,8 +225,12 @@ class CachedPageReader:
         self.cache_dir = Path(cache_dir)
         self.enabled = enabled
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # The cache holds patient names and prescriptions (PHI): owner-only.
+        _owner_only(self.cache_dir, directory=True)
         self.hits = 0
         self.misses = 0
+        self._flights: Dict[str, threading.Lock] = {}
+        self._flight_lock = threading.Lock()
 
     @property
     def model(self) -> str:
@@ -209,28 +258,55 @@ class CachedPageReader:
         return self.cache_dir / f"{key}.json"
 
     def read(self, source: PageSource) -> PageRead:
+        return self.read_detailed(source).page
+
+    def cached(self, source: PageSource) -> bool:
+        """Whether this page would be served without calling the inner reader."""
+        return self.enabled and self._path(self._key(_as_normalised(source))).exists()
+
+    def _load(self, path: Path, img: NormalisedImage) -> ReadResult:
+        payload = json.loads(path.read_text())
+        return ReadResult(
+            page=PageRead.model_validate(payload["page_read"]), image_sha256=img.sha256,
+            model=payload.get("served_by") or payload.get("model") or self.inner.model,
+            effort=payload.get("effort"),
+            # The cached entry carries ITS OWN raw reply and usage, so a page
+            # served from cache is stored with the reply that produced it.
+            raw_response=payload.get("raw_response"), usage=payload.get("usage"),
+            cost_usd=0.0, from_cache=True,
+        )
+
+    def read_detailed(self, source: PageSource) -> ReadResult:
         img = _as_normalised(source)
 
         if not self.enabled:
-            return self.inner.read(img)
+            return self.inner.read_detailed(img)
 
-        path = self._path(self._key(img))
-        if path.exists():
-            self.hits += 1
-            payload = json.loads(path.read_text())
-            return PageRead.model_validate(payload["page_read"])
+        key = self._key(img)
+        path = self._path(key)
+        # Single-flight: two requests for the same page at the same moment (a
+        # double click, a retry, the same photo twice in one upload) make ONE
+        # call. The second waits here and then reads what the first wrote.
+        with self._flight_lock:
+            lock = self._flights.setdefault(key, threading.Lock())
+        with lock:
+            if path.exists():
+                with self._flight_lock:
+                    self.hits += 1
+                return self._load(path, img)
 
-        self.misses += 1
-        page = self.inner.read(img)
+            with self._flight_lock:
+                self.misses += 1
+            result = self.inner.read_detailed(img)
 
-        path.write_text(
-            json.dumps(
+            payload = json.dumps(
                 {
-                    "page_read": page.model_dump(),
-                    "raw_response": getattr(self.inner, "last_raw_response", None),
-                    "usage": getattr(self.inner, "last_usage", None),
+                    "page_read": result.page.model_dump(),
+                    "raw_response": result.raw_response,
+                    "usage": result.usage,
                     "model": self.inner.model,
-                    "effort": getattr(self.inner, "effort", None),
+                    "served_by": result.model,
+                    "effort": result.effort,
                     "prompt_version": PROMPT_VERSION,
                     "prompt_fingerprint": prompt_fingerprint(),
                     "image_sha256": img.sha256,
@@ -239,8 +315,13 @@ class CachedPageReader:
                 indent=2,
                 default=str,
             )
-        )
-        return page
+            # Written whole or not at all: a crash mid-write must not leave a
+            # truncated entry that every later read of this page trips over.
+            tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(payload)
+            _owner_only(tmp)
+            os.replace(tmp, path)
+            return result
 
     def stats(self) -> str:
         total = self.hits + self.misses
@@ -261,32 +342,42 @@ class ClaudePageReader:
         model: str = DEFAULT_MODEL,
         effort: str = DEFAULT_EFFORT,
         enforce_spend_cap: bool = True,
+        caller=None,
     ):
-        import anthropic
+        from vlm.client import ClaudeCaller
 
         # Reads the project-root .env if present; a real env var still wins.
         load_env()
-        self.client = anthropic.Anthropic()
+        self.caller = caller or ClaudeCaller()
         self.model = model
         self.effort = effort
         self.enforce_spend_cap = enforce_spend_cap
-        self.last_raw_response: Optional[dict] = None
-        self.last_usage: Optional[dict] = None
-        self.last_cost: Optional[CallCost] = None
+
+    @property
+    def _warm_key(self) -> str:
+        return f"{self.model}:{self.effort}:{prompt_fingerprint()}"
+
+    def prefix_is_warm(self) -> bool:
+        return self.caller.prefix_is_warm(self._warm_key)
 
     def read(self, source: PageSource) -> PageRead:
-        img = _as_normalised(source)
-        guard = get_guard()
-        if self.enforce_spend_cap:
-            guard.check_before_call()
+        return self.read_detailed(source).page
 
+    def read_detailed(self, source: PageSource) -> ReadResult:
+        img = _as_normalised(source)
         img_b64 = base64.standard_b64encode(img.jpeg_bytes).decode("utf-8")
 
-        response = self.client.messages.parse(
+        done = self.caller.parse(
+            warm_key=self._warm_key,
+            spend_tag=img.sha256[:12],
+            enforce_spend_cap=self.enforce_spend_cap,
             model=self.model,
             max_tokens=MAX_TOKENS,
             thinking={"type": "adaptive"},
             output_config={"effort": self.effort},
+            # The system prompt is the stable prefix and carries the cache
+            # breakpoint. The image comes after it, so a different page never
+            # invalidates the cached prompt.
             system=[
                 {
                     "type": "text",
@@ -312,23 +403,58 @@ class ClaudePageReader:
             ],
             output_format=PageRead,
         )
-
         # Keep the raw response: §16.3 needs it and it cannot be rebuilt later.
-        #
-        # `warnings=False` because the SDK's ParsedMessage carries a
-        # ParsedTextBlock that does not match the declared ContentBlock union,
-        # so a plain model_dump emits ~15 PydanticSerializationUnexpectedValue
-        # lines per call. The dump itself is correct; only the validation
-        # chatter is wrong, and it would otherwise bury real output.
-        self.last_raw_response = response.model_dump(mode="json", warnings=False)
-        self.last_usage = (
-            response.usage.model_dump() if hasattr(response.usage, "model_dump") else dict(response.usage)
-        )
-        self.last_cost = guard.record(
-            price_call(self.model, response.usage), tag=img.sha256[:12]
+        return ReadResult(
+            page=done.parsed, image_sha256=img.sha256, model=done.served_by, effort=self.effort,
+            raw_response=done.raw_response, usage=done.usage, cost_usd=done.cost.usd,
         )
 
-        return response.parsed_output
+
+def read_many(reader: PageReader, sources: Sequence[PageSource],
+              max_workers: Optional[int] = None) -> List[Union[ReadResult, Exception]]:
+    """Read several pages at once. Results come back in input order; a page that
+    fails is returned as its exception, so one bad page does not lose the rest.
+
+    Three things keep this cheap:
+
+      * Pages already in the response cache never reach the API.
+      * The same image twice in one call is read once (single-flight).
+      * PROMPT-CACHE LEAD. A cache entry only becomes readable once the first
+        response has started, so N cold requests fired together all pay the
+        full price for the system prompt and none reads what the others are
+        writing. When the prefix is cold, ONE page goes first and the rest fan
+        out behind it and read the cache it wrote.
+    """
+    imgs = [_as_normalised(s) for s in sources]
+    results: List[Union[ReadResult, Exception, None]] = [None] * len(imgs)
+    if not imgs:
+        return []
+
+    def one(i: int) -> None:
+        try:
+            results[i] = reader.read_detailed(imgs[i])
+        except Exception as exc:  # returned to the caller, per page
+            results[i] = exc
+
+    inner = getattr(reader, "inner", reader)
+    is_cached = getattr(reader, "cached", lambda _img: False)
+    order = list(range(len(imgs)))
+    needs_api = [i for i in order if not is_cached(imgs[i])]
+    warm = getattr(inner, "prefix_is_warm", lambda: True)
+
+    if len(needs_api) > 1 and not warm():
+        lead = needs_api[0]
+        one(lead)
+        order.remove(lead)
+
+    workers = max_workers or int(os.environ.get("READER_MAX_CONCURRENCY", "4"))
+    if len(order) <= 1 or workers <= 1:
+        for i in order:
+            one(i)
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(order))) as pool:
+            list(pool.map(one, order))
+    return results  # type: ignore[return-value]
 
 
 def resolve_reader_kind(kind: str = "auto") -> str:
@@ -351,6 +477,7 @@ def build_reader(
     model: str = DEFAULT_MODEL,
     effort: str = DEFAULT_EFFORT,
     cache: bool = True,
+    caller=None,
 ) -> PageReader:
     """One place to construct the reader, so swapping it is a single argument."""
     inner: PageReader
@@ -360,7 +487,7 @@ def build_reader(
     elif kind == "mock_negative":
         inner = MockPageReader(document_type="not_a_prescription")
     elif kind == "claude":
-        inner = ClaudePageReader(model=model, effort=effort)
+        inner = ClaudePageReader(model=model, effort=effort, caller=caller)
     else:
         raise ValueError(f"unknown reader kind {kind!r}")
     return CachedPageReader(inner) if cache else inner

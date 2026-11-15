@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -54,11 +55,11 @@ from env import load_env  # noqa: E402
 load_env()
 
 import pipeline  # noqa: E402
-from auth import Role, User, require_roles  # noqa: E402
+from auth import Role, User, require_vetted  # noqa: E402
 from auth import router as auth_router  # noqa: E402
 from auth.models import aware  # noqa: E402
 from auth.routes import _event, _ip, _throttle  # noqa: E402
-from config.database import Base, SessionLocal, engine, get_db  # noqa: E402
+from config.database import SessionLocal, engine, get_db  # noqa: E402
 from config.settings import settings  # noqa: E402
 from consultations import (  # noqa: E402
     build_snapshot, doctor_details, ingest_page, mark_changed, owned_page, recompute,
@@ -69,6 +70,7 @@ from models import (  # noqa: E402
     Consultation, ConsultationStatus, ConsultationVersion, Correction, CorrectionType,
     Prescription,
 )
+from admin import router as admin_router  # noqa: E402
 from patient import router as patient_router  # noqa: E402
 from pharmacy import router as pharmacy_router  # noqa: E402
 from views import (  # noqa: E402
@@ -120,6 +122,10 @@ async def security_headers(request: Request, call_next):
     response = await call_next(request)
     for k, v in SECURITY_HEADERS.items():
         response.headers.setdefault(k, v)
+    if settings.COOKIE_SECURE:
+        # Only once the site really is on HTTPS (COOKIE_SECURE=true): tells the
+        # browser never to try plain http for this host again.
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
 
 
@@ -131,30 +137,18 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],  # the PDF download's filename
 )
 app.include_router(auth_router)
+app.include_router(admin_router)
 app.include_router(consultations_router)
 app.include_router(patient_router)
 app.include_router(pharmacy_router)
 
-doctor_only = require_roles(Role.DOCTOR)
+doctor_only = require_vetted(Role.DOCTOR)
 
 
-def _add_missing_columns() -> None:
-    """create_all() never alters an existing table, so a column added to a model
-    after a database was created is missing from it. Add those columns (all are
-    nullable). A stand-in for real migrations, which this prototype does not have."""
-    from sqlalchemy import inspect, text
+def _sms_channel() -> str:
+    from auth import notify
 
-    insp = inspect(engine)
-    with engine.begin() as conn:
-        for table in Base.metadata.sorted_tables:
-            if not insp.has_table(table.name):
-                continue
-            have = {c["name"] for c in insp.get_columns(table.name)}
-            for col in table.columns:
-                if col.name not in have and col.nullable:
-                    conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN '
-                                      f'{col.name} {col.type.compile(engine.dialect)}'))
-                    print(f"[DB] added column {table.name}.{col.name}", flush=True)
+    return notify.sms_channel()
 
 
 def _backfill_consultations() -> None:
@@ -193,17 +187,42 @@ def _backfill_consultations() -> None:
 
 @app.on_event("startup")
 def _startup() -> None:
-    Base.metadata.create_all(bind=engine)
-    _add_missing_columns()
+    from auth import notify, ratelimit
+    from auth.crypto import encrypt_legacy_secrets, using_dedicated_key
+    from config import migrate
+
+    migrate.upgrade()
+    missing = migrate.drift()
+    if missing:
+        print("[DB] WARNING: the models have changed without a migration. Missing in the database: "
+              + ", ".join(missing) + ". Run:  cd backend && alembic revision --autogenerate -m \"...\"",
+              flush=True)
+    sealed = encrypt_legacy_secrets(engine)
+    if sealed:
+        print(f"[DB] encrypted {sealed} two-step secret(s) that were stored in the clear", flush=True)
+    ratelimit.purge()
+
     pipeline.init()
     print(f"[API] reader={pipeline.reader_kind} (READER={pipeline.READER_SETTING}) "
           f"prompt={PROMPT_VERSION}", flush=True)
     _backfill_consultations()
     cfg = load_config()
     print(f"[API] vocabulary region={cfg.region} nlem={cfg.nlem_enabled}", flush=True)
+    print(f"[API] phone codes travel by: {notify.sms_channel()}"
+          + ("" if notify.sms_channel() == "sms" else
+             "  (not a real text message: a 'verified phone' is not proof of the phone)"), flush=True)
+    print(f"[API] vetting of doctors and pharmacies: {'required' if settings.REQUIRE_VETTING else 'OFF'}",
+          flush=True)
     if "change-in-production" in settings.SECRET_KEY:
         print("[API] WARNING: SECRET_KEY is the built-in default. Set it in .env "
               "before anyone but a developer uses this.", flush=True)
+    if not using_dedicated_key():
+        print("[API] note: DATA_ENCRYPTION_KEY is not set, so two-step secrets are encrypted with a "
+              "key derived from SECRET_KEY. Changing SECRET_KEY will then lock those users out.",
+              flush=True)
+    if not settings.REQUIRE_VETTING:
+        print("[API] WARNING: REQUIRE_VETTING is off. Anyone who registers as a doctor can issue "
+              "prescriptions. Development only.", flush=True)
 
 
 class CorrectionIn(BaseModel):
@@ -230,6 +249,11 @@ def health():
         # ANTHROPIC_API_KEY to .env and restarting turns it off.
         "reader_is_mock": pipeline.is_mock(),
         "api_key_configured": api_key_configured(),
+        # ok | auth_error | model_unavailable | unreachable | not_run (mock).
+        # A free check made at startup, so a wrong key shows here at once.
+        "reader_check": pipeline.reader_check,
+        # ok | missing: the two medicine CSVs brand matching needs (README §9).
+        "medicine_data": pipeline.medicine_data(),
         "prompt_version": PROMPT_VERSION,
         "spend_usd": round(guard.total_usd(), 4),
         "spend_cap_usd": guard.cap_usd,
@@ -237,6 +261,9 @@ def health():
         # Where demo codes can be read (Mailpit), so the UI can link to it.
         # Unset outside a demo setup.
         "demo_inbox_url": os.environ.get("DEMO_INBOX_URL") or None,
+        # sms | email | console: how a phone code really travels.
+        "phone_codes_by": _sms_channel(),
+        "vetting_required": settings.REQUIRE_VETTING,
     }
 
 
@@ -249,10 +276,12 @@ async def upload_prescription(
     it opens a consultation around the page, which the doctor completes on the
     review screen (POST /api/consultations is the normal path)."""
     profile = json.loads(user.profile_json or "{}")
-    c = Consultation(doctor_id=user.id, clinic_address=profile.get("clinic_address"))
+    # The id is assigned here and nothing is flushed yet: a flush would take the
+    # database's write lock, and the read-limit check inside ingest_page (which
+    # writes on its own connection) would then wait on this very request.
+    c = Consultation(id=str(uuid.uuid4()), doctor_id=user.id, clinic_address=profile.get("clinic_address"))
     db.add(c)
-    db.flush()
-    rx = await ingest_page(db, image, c)
+    rx = await ingest_page(db, image, c, user)
     _event(db, request, "page_uploaded", user.id, f"{c.id} page 1")
     db.commit()
     db.refresh(rx)
@@ -438,6 +467,9 @@ def verify_document(verification_id: str, request: Request, db: Session = Depend
         "latest_version": latest.version, "superseded": latest.version > v.version,
         "finalised_at": aware(v.finalised_at).isoformat(),
         "doctor_name": doc.get("name"), "registration_no": doc.get("registration_no"),
+        # Whether an administrator had reviewed the doctor's registration
+        # details when this version was finalised. Not a register lookup.
+        "doctor_vetted": bool(doc.get("vetted")),
         "speciality": doc.get("speciality"), "clinic_address": doc.get("clinic_address"),
         "medicine_count": len(snap.get("medicines", [])),
     }

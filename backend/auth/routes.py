@@ -57,6 +57,7 @@ from .models import (
     RecoveryCode,
     Role,
     User,
+    Vetting,
     aware,
 )
 from .notify import deliver
@@ -160,6 +161,7 @@ _PROFILE_FIELDS: Dict[Role, Dict[str, bool]] = {
     Role.DOCTOR: {"speciality": True, "clinic_address": True, "registration_no": False},
     Role.CHEMIST: {"pharmacy_name": True, "pharmacy_address": True, "drug_licence_no": False},
     Role.PATIENT: {},
+    Role.ADMIN: {},
 }
 _PROFILE_LABELS = {
     "speciality": "Speciality", "clinic_address": "Clinic address",
@@ -201,10 +203,22 @@ class UserOut(BaseModel):
     recovery_codes_remaining: int
     profile: Dict[str, str]
     created_at: str
+    # Doctors and pharmacies only: pending | approved | rejected. `can_practise`
+    # is what the UI should branch on (it also reflects REQUIRE_VETTING).
+    vetting_status: Optional[str] = None
+    vetting_note: Optional[str] = None
+    can_practise: bool = True
+
+
+def can_practise(u: User) -> bool:
+    return u.is_vetted or not settings.REQUIRE_VETTING
 
 
 def user_out(u: User) -> UserOut:
     return UserOut(
+        vetting_status=(u.vetting_status or Vetting.PENDING.value) if u.needs_vetting else None,
+        vetting_note=u.vetting_note if u.needs_vetting else None,
+        can_practise=can_practise(u),
         id=u.id, role=u.role.value, full_name=u.full_name,
         username=u.username, email=u.email, phone=u.phone,
         email_verified=u.email_verified_at is not None,
@@ -506,6 +520,37 @@ def require_roles(*roles: Role):
     return dep
 
 
+# What an administrator checks, per role. Editing any of these after approval
+# sends the account back to `pending` (update_me).
+_IDENTITY_FIELDS = {Role.DOCTOR: ("registration_no",), Role.CHEMIST: ("pharmacy_name", "drug_licence_no")}
+
+
+def _reviewed_identity(u: User) -> tuple:
+    profile = json.loads(u.profile_json or "{}")
+    return (u.full_name,) + tuple(profile.get(k) or "" for k in _IDENTITY_FIELDS.get(u.role, ()))
+
+
+NOT_VETTED = ("Your account is waiting to be verified by PrescriptAI. "
+              "You can use this once an administrator has approved it.")
+REJECTED = "Your account was not approved. Contact PrescriptAI if you think this is a mistake."
+
+
+def require_vetted(*roles: Role):
+    """`require_roles`, plus: a doctor or pharmacy must have been approved by an
+    administrator (Workflow.md §10 Q5). Every route that issues, reads or
+    dispenses a prescription uses this, so an account that merely registered as
+    a doctor can sign in and see its status, and nothing else."""
+    base = require_roles(*roles)
+
+    def dep(user: User = Depends(base)) -> User:
+        if not can_practise(user):
+            raise HTTPException(
+                403, REJECTED if user.vetting_status == Vetting.REJECTED.value else NOT_VETTED)
+        return user
+
+    return dep
+
+
 # ─── registration ────────────────────────────────────────────────────────────
 
 
@@ -513,6 +558,10 @@ def require_roles(*roles: Role):
 def register(body: RegisterIn, request: Request, response: Response,
              db: Session = Depends(get_db)):
     _throttle("register_ip", _ip(request), 10, 15 * 60)
+    if body.role == Role.ADMIN:
+        # Administrators approve doctors and pharmacies. One that could
+        # self-register would make vetting meaningless.
+        raise HTTPException(403, "Administrator accounts cannot be created here.")
 
     email = norm_email(body.email) if body.email else None
     phone = norm_phone(body.phone) if body.phone else None
@@ -535,6 +584,7 @@ def register(body: RegisterIn, request: Request, response: Response,
         email=email, phone=phone, username=username,
         password_hash=hash_password(body.password),
         profile_json=json.dumps(_clean_profile(body.role, body.profile)),
+        vetting_status=Vetting.PENDING.value if body.role in (Role.DOCTOR, Role.CHEMIST) else None,
     )
     db.add(user)
     db.flush()
@@ -649,12 +699,20 @@ def me(user: User = Depends(current_user)):
 @router.patch("/me", response_model=UserOut)
 def update_me(body: ProfileIn, request: Request, user: User = Depends(current_user),
               db: Session = Depends(get_db)):
+    before = _reviewed_identity(user)
     if body.full_name is not None:
         user.full_name = body.full_name.strip()
     if body.profile is not None:
         merged = {**json.loads(user.profile_json or "{}"), **_clean_profile(user.role, body.profile, partial=True)}
         _clean_profile(user.role, merged)  # still complete after the edit
         user.profile_json = json.dumps(merged)
+    if user.needs_vetting and _reviewed_identity(user) != before and user.vetting_status != Vetting.PENDING.value:
+        # The administrator approved a specific name and registration number.
+        # Changing either is a new claim, so it is reviewed again: otherwise an
+        # approved account could simply rename itself into someone else.
+        user.vetting_status, user.vetted_at, user.vetted_by = Vetting.PENDING.value, None, None
+        user.vetting_note = "Identity details changed after approval; awaiting review."
+        _event(db, request, "vetting_reset", user.id, "identity details changed")
     _event(db, request, "profile_updated", user.id)
     db.commit()
     db.refresh(user)

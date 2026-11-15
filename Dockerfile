@@ -42,6 +42,12 @@ ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
 COPY backend/requirements.txt backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
+# The server does not run as root: a bug in an image parser or the web server
+# should not be a root shell in the container.
+RUN useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin app
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
+
 # main.py puts ../ml_pipeline on sys.path, so keep the repo layout.
 COPY ml_pipeline/ ml_pipeline/
 COPY backend/ backend/
@@ -49,8 +55,15 @@ COPY --from=web /web/dist /app/web_dist
 
 ENV WEB_DIST=/app/web_dist \
     DATABASE_URL=sqlite:////app/data/prescriptai.db
-RUN mkdir -p /app/data /app/backend/uploads /app/ml_pipeline/.cache
+RUN mkdir -p /app/data /app/backend/uploads /app/ml_pipeline/.cache /app/ml_pipeline/data/india \
+    && chown -R app:app /app/data /app/backend/uploads /app/ml_pipeline/.cache
 
 WORKDIR /app/backend
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# The entrypoint hands the three data volumes to `app` (volumes made by an
+# earlier, root image are root-owned) and then drops root for good.
+ENTRYPOINT ["docker-entrypoint.sh"]
+# --proxy-headers: behind the HTTPS proxy (docker-compose.prod.yml) the client's
+# real address comes from X-Forwarded-For; it is trusted only from the hosts in
+# FORWARDED_ALLOW_IPS (default: none but localhost).
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

@@ -21,6 +21,7 @@ import VerifyDocumentPage from './pages/VerifyDocumentPage'
 import PharmacyHomePage from './pages/pharmacy/PharmacyHomePage'
 import PharmacyGrantPage from './pages/pharmacy/PharmacyGrantPage'
 import DispensingRecordsPage from './pages/pharmacy/DispensingRecordsPage'
+import AdminPage from './pages/admin/AdminPage'
 import { useAuthStore } from './store/useAuthStore'
 
 // Prescription screens hold patient data: doctors only (the API enforces the
@@ -61,6 +62,7 @@ export default function App() {
         <Route path="pharmacy" element={chemist(<PharmacyHomePage />)} />
         <Route path="pharmacy/grants/:id" element={chemist(<PharmacyGrantPage />)} />
         <Route path="pharmacy/records" element={chemist(<DispensingRecordsPage />)} />
+        <Route path="admin" element={<RequireAuth roles={['admin']}><AdminPage /></RequireAuth>} />
       </Route>
     </Routes>
   )

@@ -4,7 +4,7 @@ import {
   UploadCloud, X, Loader2, AlertCircle, ScanLine, Sun, Crop, Focus, UserRound, Plus,
 } from 'lucide-react'
 import { useAuthStore } from '../store/useAuthStore'
-import { createConsultation, uploadPage, apiError } from '../services/api'
+import { createConsultation, uploadPages, apiError } from '../services/api'
 import DemoReaderBanner from '../components/DemoReaderBanner'
 
 /**
@@ -39,7 +39,8 @@ export default function UploadPage() {
   const [dragActive, setDragActive] = useState(false)
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
-  const [progress, setProgress] = useState(null) // { page, of, stage }
+  const [progress, setProgress] = useState(null) // { of, stage }
+  const [results, setResults] = useState(null)   // per-file outcome when something did not go in
   const [created, setCreated] = useState(null)   // consultation id once it exists
   const timer = useRef(null)
 
@@ -63,6 +64,7 @@ export default function UploadPage() {
     if (!files.length) return setError('Add at least one page.')
     setBusy(true)
     setError(null)
+    setResults(null)
     let id = created
     try {
       if (!id) {
@@ -70,13 +72,18 @@ export default function UploadPage() {
         id = c.id
         setCreated(id)
       }
-      for (let i = 0; i < files.length; i++) {
-        setProgress({ page: i + 1, of: files.length, stage: 0 })
-        clearInterval(timer.current)
-        timer.current = setInterval(() => setProgress((p) => p && { ...p, stage: Math.min(p.stage + 1, STAGES.length - 1) }), 4000)
-        await uploadPage(id, files[i].file)
-      }
-      navigate(`/consultations/${id}`)
+      // One request for every page: the server skips exact duplicates before
+      // any reading, reads the rest in parallel, and reports per file.
+      setProgress({ of: files.length, stage: 0 })
+      timer.current = setInterval(() => setProgress((p) => p && { ...p, stage: Math.min(p.stage + 1, STAGES.length - 1) }), 4000)
+      const out = await uploadPages(id, files.map((f) => f.file))
+      const failed = out.results.filter((r) => r.status === 'failed')
+      if (failed.length === 0) return navigate(`/consultations/${id}`)
+      // Some pages are in, some are not. Say exactly which, and keep only the
+      // ones still to retry in the list.
+      setResults(out.results)
+      setFiles((cur) => cur.filter((f) => failed.some((r) => r.filename === f.file.name)))
+      setError(`${failed.length} of ${out.results.length} page${out.results.length === 1 ? '' : 's'} could not be read.`)
     } catch (err) {
       // No fabricated result: a failure is reported as a failure. Pages read
       // before it are kept in the consultation and the doctor can open it.
@@ -175,7 +182,7 @@ export default function UploadPage() {
             <div className="flex items-center gap-3">
               <Loader2 size={18} className="animate-spin text-care-700" />
               <span className="text-sm font-medium text-ink-800">
-                Page {progress.page} of {progress.of}: {STAGES[progress.stage]}
+                {progress.of > 1 ? `${progress.of} pages together: ` : ''}{STAGES[progress.stage]}
               </span>
             </div>
             <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-ink-100">
@@ -190,6 +197,16 @@ export default function UploadPage() {
             <div>
               <p className="font-semibold">{created ? 'Not every page was processed.' : 'Nothing was saved.'}</p>
               <p className="mt-0.5">{error}</p>
+              {results && (
+                <ul className="mt-2 space-y-0.5">
+                  {results.map((r, i) => (
+                    <li key={i}>
+                      <span className="font-medium">{r.filename}</span>:{' '}
+                      {r.status === 'added' ? `read, page ${r.page_no}` : r.status === 'duplicate' ? `skipped. ${r.detail}` : r.detail}
+                    </li>
+                  ))}
+                </ul>
+              )}
               {created && (
                 <p className="mt-1.5">
                   Pages read before this are kept. <Link to={`/consultations/${created}`} className="font-semibold underline">Open the consultation</Link> or try again.

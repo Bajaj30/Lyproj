@@ -10,8 +10,10 @@ actually happened, including the things that did not work.
 
 ## Where the project is right now
 
-**Every Workflow.md stage is built** (Session 9). The product runs end to end on
-the mock reader; adding `ANTHROPIC_API_KEY` to `.env` switches it to real reads.
+**Every Workflow.md stage is built** (Session 9), and the production gaps that
+could be closed without outside accounts are closed (Session 10). The product runs
+end to end on the mock reader; adding `ANTHROPIC_API_KEY` to `.env` switches it to
+real reads. What to check on the first real calls: `docs/API_IMPLEMENTATION.md` §1.9.
 
 | Stage | Status | Notes |
 |---|---|---|
@@ -35,6 +37,12 @@ the mock reader; adding `ANTHROPIC_API_KEY` to `.env` switches it to real reads.
 | Pharmacy: OTP sharing, pack checks, expiry, record | ✅ built, tested | Session 9. Stages 5–7. 98 API + 38 browser checks |
 | Upload stored-XSS | ✅ fixed | Session 9. Real-format extensions, safe image serving, CSP + security headers |
 | Reader slot for the API key | ✅ | Session 9. `READER=auto`: mock until `ANTHROPIC_API_KEY` is set |
+| API calling: parallel pages, duplicates, refusals | ✅ built, tested with a fake client | Session 10. **Not run live since the rewrite** |
+| Vetting, admin role, encrypted TOTP secrets, DB rate limits | ✅ built, tested | Session 10 |
+| Alembic migrations | ✅ built, tested on a legacy DB | Session 10 |
+| Real SMS (Twilio / webhook) | 🟡 built | Session 10. Tested against a stand-in; never sent a real text |
+| Docker: non-root, HTTPS overlay | ✅ built, tested in containers | Session 10. 137 API checks against the image |
+| Tests in the repo | ✅ | Session 10. `python tests/run.py` |
 
 ### Live API status: verified
 
@@ -43,6 +51,145 @@ unverified SDK assumption (§6.4). Structured output, prompt caching, the spend
 ledger and the verbatim rule all confirmed on real calls.
 
 Spend so far: **$0.0686 across 2 calls**, cap $5.00.
+
+---
+
+## Session 10: Closing the production gaps, and making API calls safe to run in parallel
+
+The brief was to finish what Session 9 listed as remaining and to write
+[`docs/API_IMPLEMENTATION.md`](docs/API_IMPLEMENTATION.md): how API calls are kept
+few (multiple and duplicate prescriptions), and the security features. No API key
+was available, so everything that calls the API is proven with a fake client, and
+the guide's §1.9 lists what to check on the first real calls.
+
+### API calling
+
+**The reader was not safe to run twice at once, and was already wrong for a cache
+hit.** It kept "the last call's" raw reply, usage and cost on itself, and the
+backend read them back after `read()` returned. Two pages in flight would swap
+them. A single cache hit was stored with the *previous miss's* raw reply and cost,
+and with `from_cache = False`. That is field 1 of §16.3, the one that cannot be
+rebuilt. Every read now returns its own `ReadResult`; the cache entry carries its
+own raw reply.
+
+**Reads ran on the event loop.** `upload` was `async def` and called the blocking
+reader inline, so one 20-second read froze the server for every other user. Reads
+now run in a worker thread.
+
+What was built on top of that:
+
+- **`vlm/client.py`: one place that calls the API**, for both readers. SDK retries
+  and timeouts (no second retry loop), a server-wide concurrency cap, the spend cap
+  as a *reservation* (six parallel calls against a cap with room for two: two reach
+  the API), `stop_reason` handling (`refusal` and `max_tokens` raise; neither is
+  ever stored or cached as a reading), and `fallbacks: "default"` for classifier
+  refusals. The fallback is a beta parameter that could not be tried live, so a
+  `400` on it retries once without it and drops it for the process.
+- **Batch upload** (`POST /api/consultations/{id}/pages/batch`). Exact duplicates
+  are dropped first, the rest are read in parallel, the interaction check runs once.
+  One result per file, so a bad page does not lose the good ones.
+- **Prompt-cache lead.** A cache entry is readable only once the first response has
+  started, so N cold requests fired together all pay the write price. When the
+  prefix is cold, one page goes first and the rest follow.
+- **Duplicates, three kinds.** The same image in the same prescription is a `409`
+  before any reading. The same image in another of the *same doctor's*
+  consultations is served from cache and pointed out (never across doctors). Two
+  pages that *read* identically are flagged, and finalising needs the page removed
+  or `acknowledge_duplicates`: a duplicated page is every medicine prescribed, and
+  dispensed, twice.
+- **Per-doctor daily read limit**, behind the global spend cap.
+- **Errors safe to show.** The old `Reader failed: <exception>` put the spend
+  ledger's path on the doctor's screen.
+- **A free key check at startup** (`/api/health` → `reader_check`), so a wrong key
+  shows at once.
+
+**Not built, deliberately:** perceptual hashing for re-photographed pages. Pages
+from one pad share a letterhead, so the threshold would need tuning on real pages,
+which this checkout does not have; a false positive would silently skip a real page.
+
+### Security
+
+- **Vetting (closes open item 9).** Doctors and pharmacies start `pending`; every
+  clinical route refuses them until an administrator approves (`require_vetted`,
+  `admin.py`, `/admin`). Administrators exist only via `manage.py create-admin`.
+  Editing the name or registration number after approval sends the account back
+  for review: otherwise an approved account could rename itself. Approval means a
+  person reviewed the number; nothing looks it up, and the verify page says so.
+- **TOTP secrets encrypted at rest (open item 6).** Fernet, via a column type, so
+  code sees plain text and the database never does. This is the first auth
+  dependency outside the standard library (`cryptography`): Session 7 avoided it,
+  but the standard library has no authenticated cipher and writing one would be
+  the worse risk. Still open: the key is in the environment, not a KMS.
+- **Rate limits in the database (open item 8).** Shared by every worker and kept
+  across a restart; keys stored as a keyed hash. Chosen over Redis because it
+  needs no new service and could be tested here.
+- **Real SMS (open item 7).** `twilio`, and `webhook` for any other gateway. Never
+  sent a real text.
+- **Alembic.** A pre-migration database is adopted once (brought to the current
+  models the old way, then stamped). Startup warns if a model has no migration.
+- **Docker.** The server no longer runs as root; `docker-compose.prod.yml` puts
+  Caddy in front for HTTPS; the medicine CSVs mount from the host.
+
+### Bugs found by running it
+
+- **The rate limiter deadlocked against its own request.** The legacy upload route
+  flushed a row and *then* checked the read limit. The limiter writes on its own
+  connection, so it waited 5 seconds for a lock its caller held, then fell back to
+  in-memory counting. Every check passed, which is why it hid; it showed only as
+  one line in the container log. Fixed (no write before the check; the limiter's
+  connection waits at most a second), and "the limiter never fell back" is now a
+  standing check on every run.
+- **Two tests could not work against a container.** They move a clock by editing
+  the SQLite file, and a host write through Docker Desktop's shared folder is not
+  seen by SQLite inside. The suite can now run that SQL where the server runs
+  (`E2E_SQL_CMD`).
+- **I printed two freshly generated secrets into the session output** while
+  creating `.env` and `.env.docker` (a masking pattern that does not work with
+  macOS `sed`). Nothing had used them; both files were regenerated.
+- **Yesterday's two scratch test scripts were gone**: the scratchpad was cleared
+  overnight. They are rewritten in `tests/`, which is where they belonged.
+
+### Verified
+
+- `python tests/run.py`: **89 unit** (33 reader, 23 dispensing, 33 security),
+  **137 + 6 API**, **50 browser**. Mock reader, 15-brand fixture.
+- **A database made by Session 9's commit**, with a doctor who had two-step
+  verification on: adopted (4 columns added), secret encrypted in place, the same
+  authenticator still signs in, the old verification ID still verifies, and the
+  doctor is `pending` until an administrator approves.
+- **In Docker:** the real `docker-compose.yml` starts first time as uid 10001; all
+  137 API checks pass against the container; a lockout survives a container
+  restart; the HTTPS file serves TLS, redirects http, sets a `Secure` cookie and
+  HSTS, does not publish the app port, and the app records the real client address
+  through the proxy.
+
+**Not verified:** anything against the live API (no key); a real text message; a
+real domain with a Let's Encrypt certificate; the real 239k-brand data.
+
+### Left open, and why
+
+- **Link-only pack QR codes.** Resolving one means the server fetching a URL
+  printed on a pack: an SSRF risk, and no standard page format to read.
+- **"What it is used for" on the patient screen.** No content source, and it must
+  not be invented.
+- **Patients without a smartphone** (Workflow §10 Q7): a product decision, and
+  meaningless until a real SMS provider is connected.
+- **Open items 4 and 5** (strength in `drug_token`; AMBIGUOUS on a real page) need
+  real model output, as they always did.
+- **Collecting on someone's behalf** (Q8) needs nothing built: the sharing code is
+  a bearer code, so the patient can pass it on.
+
+### Open items added
+
+17. **Run the live checklist** (`docs/API_IMPLEMENTATION.md` §1.9), the fallback
+    parameter and the pack reader especially.
+18. **Existing doctor and pharmacy accounts become `pending` on upgrade.** Create an
+    administrator and approve them.
+19. **The spend ledger is per process.** Move it to the database before running
+    more than one worker.
+20. **Message Batches for offline re-reads** (50% cheaper), and a move to
+    `claude-opus-5-5` (≈20% cheaper, but `thresholds.yaml` is calibrated on Opus
+    5's confidences). Both are in the guide's §1.8.
 
 ---
 
@@ -1057,8 +1204,12 @@ Recording these so they are not mistaken for oversights:
 
 ```bash
 # backend (READER=mock for zero-cost UI work)
+cd backend && python3 manage.py create-admin  # once: approves doctors and pharmacies
 cd backend && python3 main.py                 # -> http://localhost:8000
 cd backend && READER=mock python3 main.py     # no API key, no cost
+
+# every check, on a throwaway server (mock reader, no spend)
+.venv/bin/python tests/run.py
 
 # frontend
 cd web_app && npm install && npm run dev      # -> http://localhost:5173

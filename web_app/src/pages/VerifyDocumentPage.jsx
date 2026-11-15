@@ -71,7 +71,12 @@ export default function VerifyDocumentPage() {
             <dt className="text-ink-500">Finalised</dt><dd>{new Date(r.finalised_at).toLocaleString()}</dd>
             <dt className="text-ink-500">Medicines</dt><dd>{r.medicine_count}</dd>
           </dl>
-          <p className="mt-4 text-xs text-ink-600">The patient and the medicines are not shown here, on purpose. A registration number is self-declared by the doctor and has not been checked against a medical council register.</p>
+          <p className="mt-4 text-xs text-ink-600">
+            The patient and the medicines are not shown here, on purpose.{' '}
+            {r.doctor_vetted
+              ? 'A PrescriptAI administrator reviewed this doctor’s registration details before the account could issue prescriptions. It was not checked automatically against a medical council register.'
+              : 'This prescription was issued before the doctor’s account was reviewed: the registration number is as the doctor declared it.'}
+          </p>
         </section>
       )}
     </div>
