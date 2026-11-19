@@ -160,7 +160,7 @@ check("percent confidences become 0-1", abs(p.medicines[3].confidence - 0.77) < 
 check("raw_text keeps every cell of the row", p.medicines[0].raw_text == "OFLAZEST OZ 1-0-1 3 days", p.medicines[0].raw_text)
 check("no alternatives are invented", all(m.alternatives == [] for m in p.medicines))
 check("provenance: model 'koncile', its own mapping version, $0",
-      res.model == "koncile" and res.prompt_version == "koncile-k1" and res.cost_usd == 0.0)
+      res.model == "koncile" and res.prompt_version == "koncile-k2" and res.cost_usd == 0.0)
 check("the raw reply is kept whole for the correction log",
       res.raw_response["result"]["General_fields"]["Doctor's name"]["value"] == "Dr. A. Example")
 
@@ -181,6 +181,30 @@ check("'not a prescription' lists no medicines (PageRead contract)",
 q = to_page_read({"General_fields": {}, "Line_fields": {}}, cfg)
 check("an empty reply says so instead of looking like a blank prescription",
       q.medicines == [] and q.unreadable_regions)
+
+# The columns of Koncile's own prescription template, as seen on a real reply
+# (values made up). Its "Dosage" holds the schedule, durations are bare days.
+def col(*vals):
+    return [{"value": v, "confidence_score": 0.95} for v in vals]
+
+
+REAL = {"Medication name": col("ZOFER", "ANDIAL"), "Quantity": col("6", "5"),
+        "Dosage": col("1-0-1", "2, then 1 every 6 hours"),
+        "Duration of treatment (in days)": col("3", "3"),
+        "Additional information": col("after food", ""), "Refill": col("", "")}
+q = to_page_read({"General_fields": GENERAL, "Line_fields": REAL}, cfg)
+m0, m1 = q.medicines
+check("real template: 'Dosage' (the schedule) fills How often, not Dose",
+      m0.frequency == "1-0-1" and m1.frequency == "2, then 1 every 6 hours" and m0.dosage is None,
+      (m0.frequency, m0.dosage))
+check("real template: a bare duration takes 'days' from its column name",
+      m0.duration == "3 days", m0.duration)
+check("real template: 'Additional information' fills Instructions",
+      m0.instructions == "after food" and m1.instructions is None, (m0.instructions, m1.instructions))
+check("real template: Quantity stays visible in the row as written", "6" in m0.raw_text.split(), m0.raw_text)
+check("a duration that already has words is left alone",
+      to_page_read({"Line_fields": {"Medication name": col("X"), "Duration": col("5 days")}}, cfg)
+      .medicines[0].duration == "5 days")
 
 # ── the calls it makes ───────────────────────────────────────────────────────
 up = fake.uploads[0]
@@ -203,7 +227,7 @@ cached = CachedPageReader(reader(fake), cache_dir=TMP / "cache")
 first = cached.read_detailed(page(3))
 again = cached.read_detailed(page(3))
 check("the same image twice costs one Koncile call", len(fake.uploads) == 1 and again.from_cache)
-check("a cache hit keeps Koncile's provenance", again.model == "koncile" and again.prompt_version == "koncile-k1")
+check("a cache hit keeps Koncile's provenance", again.model == "koncile" and again.prompt_version == "koncile-k2")
 key = cached._key(page(3))
 check("the cache key names Koncile, not the Claude prompt", "koncile" in key and "_v2_" not in key, key)
 ledger = [e for e in get_guard()._read() if str(e.get("tag", "")).startswith("koncile:")]

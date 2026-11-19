@@ -87,8 +87,18 @@ It now follows the pack reader (`pack_reader_is_mock` in `/api/health`).
 
 **Verified:** 42 new checks against a fake Koncile server; the whole suite
 unchanged (131 unit, 137 + 6 API, 50 browser).
-**Not verified:** a live Koncile call. The exact field layout of a real reply is
-the open question: check the first real page's `raw_response` against the mapping.
+
+**First live reply (VLM_CHECK/2.jpg):** the parser's guess at the layout was
+right: every field is `{value, confidence_score}`, line fields are
+column-oriented. All 4 medicines read; 3 CONFIRMED against the vocabulary,
+1 UNMATCHED. The mapping was not: Koncile's template has no frequency column.
+Its `Dosage` holds the schedule ("1-0-1", "2, then 1 every 6 hours"),
+`Duration of treatment (in days)` is a bare "3", and `Additional information`
+went unmapped. Mapping **k2**: `Dosage` fills frequency, bare durations take
+their unit from the column name, `Additional information` fills instructions.
+5 checks added on the template's real column names (47 in all).
+Koncile also interprets: the handwritten "2 (6hr)-1" came back as
+"2, then 1 every 6 hours".
 
 **Notes:** Koncile reads may normalise spelling, so `raw_reading` is Koncile's
 text, not a guaranteed verbatim transcription. No `alternatives`, no line boxes.

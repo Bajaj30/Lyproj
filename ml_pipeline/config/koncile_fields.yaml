@@ -51,12 +51,20 @@ lines:
   drug:
     match: [[medic, name], [drug, name], [product, name], [brand], [medic], [drug], [medicine], [product], [name]]
     exclude: [dos, strength, freq, durat, instruc, quantit, route]
+  # Koncile's prescription template (seen on a real reply, Nov 2026) has these
+  # columns: Medication name, Quantity, Dosage, Duration of treatment (in days),
+  # Additional information, Refill. Its "Dosage" holds the SCHEDULE ("1-0-1",
+  # "2, then 1 every 6 hours"), which PageRead calls frequency; there is no
+  # strength column. So "Dosage" fills frequency, and dosage takes only an
+  # explicit strength. Quantity and Refill stay in raw_text ("As written").
   dosage:
-    match: [[dosage], [dose], [strength]]
+    match: [[strength], [dose, strength]]
     exclude: [freq]
   frequency:
-    match: [[freq], [posolog], [schedule], [times]]
+    match: [[freq], [posolog], [schedule], [times], [dosage], [dose]]
+    exclude: [strength]
+  # A bare number gets its unit from the column name ("3" in "... (in days)" -> "3 days").
   duration:
     match: [[durat], [days], [period]]
   instructions:
-    match: [[instruc], [note], [comment], [route], [timing], [direction]]
+    match: [[instruc], [note], [comment], [route], [timing], [direction], [additional, information]]

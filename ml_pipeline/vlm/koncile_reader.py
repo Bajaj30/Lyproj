@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 import threading
 import time
@@ -60,7 +61,7 @@ from vlm.spend import CallCost, get_guard  # noqa: E402
 
 MODEL = "koncile"
 # Bump when the same Koncile reply would now become a different PageRead.
-MAPPING_VERSION = "k1"
+MAPPING_VERSION = "k2"   # k2: Koncile's "Dosage" is the schedule; durations get units
 FIELDS_PATH = Path(__file__).resolve().parent.parent / "config" / "koncile_fields.yaml"
 DEFAULT_CONFIDENCE = 0.5      # a field Koncile returned without a score
 
@@ -68,6 +69,18 @@ _VALUE_KEYS = ("value", "text", "content", "answer", "raw_value", "normalized_va
 _CONF_KEYS = ("confidence_score", "confidence", "score", "probability", "conf")
 _EMPTY = {"", "not found", "n/a", "na", "none", "null", "-", "—"}
 _FALSE = {"false", "no", "non", "0", "faux"}
+_UNITS = (("day", "days"), ("week", "weeks"), ("month", "months"))
+
+
+def _with_unit(column: Optional[str], value: Optional[str]) -> Optional[str]:
+    """A bare number takes its unit from the column name: "3" under
+    "Duration of treatment (in days)" reads as "3 days"."""
+    if value and column and re.fullmatch(r"\d+(\.\d+)?", value.strip()):
+        low = column.lower()
+        for word, unit in _UNITS:
+            if word in low:
+                return f"{value.strip()} {unit}"
+    return value
 
 
 def _int_or_none(v: Optional[str]) -> Optional[int]:
@@ -193,9 +206,11 @@ def to_page_read(result: dict, cfg: dict) -> PageRead:
         cols = list(cells)
         taken: Tuple[str, ...] = ()
         picked: Dict[str, Tuple[Optional[str], Optional[float]]] = {}
+        column: Dict[str, Optional[str]] = {}
         for target in ("drug", "dosage", "frequency", "duration", "instructions"):
             n = _pick(cols, L.get(target), taken)
             picked[target] = cells[n] if n else (None, None)
+            column[target] = n
             taken += (n,) if n else ()
         if not any(v for v, _ in cells.values()):
             continue
@@ -209,7 +224,8 @@ def to_page_read(result: dict, cfg: dict) -> PageRead:
             drug_token=drug,
             alternatives=[],
             dosage=picked["dosage"][0], frequency=picked["frequency"][0],
-            duration=picked["duration"][0], instructions=picked["instructions"][0],
+            duration=_with_unit(column["duration"], picked["duration"][0]),
+            instructions=picked["instructions"][0],
             confidence=dconf if dconf is not None else (min(row_confs) if row_confs else DEFAULT_CONFIDENCE),
             legible=bool(drug),
         ))
