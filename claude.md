@@ -54,6 +54,48 @@ Spend so far: **$0.0686 across 2 calls**, cap $5.00.
 
 ---
 
+## Session 11: Koncile as a page reader
+
+The team chose Koncile (koncile.ai, a hosted extraction service with a free
+trial) over an Anthropic key for the demo. It plugs into the existing reader slot
+(`PageReader` Protocol), so S2–S5, the database and the screens are unchanged.
+Plan of record for further readers: [`docs/BLUEPRINT_INTEGRATION_PLAN.md`](docs/BLUEPRINT_INTEGRATION_PLAN.md).
+
+**Built** (`ml_pipeline/vlm/koncile_reader.py`, from Koncile's public OpenAPI
+spec v1.1.0): upload → poll `fetch_tasks_results` → `General_fields` /
+`Line_fields` → `PageRead`.
+
+- Field names come from the template in the Koncile app, so the mapping is a
+  config file (`config/koncile_fields.yaml`), not code. The spec does not document
+  the inside of those two objects; the parser accepts bare values or
+  `{value, confidence}`, and column-, row- or table-shaped line fields.
+- `READER=auto`: Claude if an Anthropic key is set (unchanged), else Koncile if
+  `KONCILE_API_KEY` is set, else the mock.
+- Own cache identity (not the Claude prompt fingerprint) and own
+  `prompt_version` (`koncile-k1`) in the correction log. Claude's cache keys and
+  provenance are untouched.
+- Per-reader thresholds (`reading.profiles` in `thresholds.yaml`): Koncile scores
+  85–97% where Opus 5 scored 0.50–0.62. The Koncile numbers are guesses.
+- An upload is retried only when it certainly did not register (no connection,
+  429, 503), so a retry never spends credits twice. Files are named by image hash,
+  never the original name.
+
+**A bug this would have caused, fixed:** the pharmacy's "Demo reader" banner
+followed the PAGE reader. With Koncile reading pages, pack photos are still the
+mock, and the banner would have vanished: a sample pack reading shown as real.
+It now follows the pack reader (`pack_reader_is_mock` in `/api/health`).
+
+**Verified:** 42 new checks against a fake Koncile server; the whole suite
+unchanged (131 unit, 137 + 6 API, 50 browser).
+**Not verified:** a live Koncile call. The exact field layout of a real reply is
+the open question: check the first real page's `raw_response` against the mapping.
+
+**Notes:** Koncile reads may normalise spelling, so `raw_reading` is Koncile's
+text, not a guaranteed verbatim transcription. No `alternatives`, no line boxes.
+Real prescriptions sent to Koncile make it a processor of patient data.
+
+---
+
 ## Session 10: Closing the production gaps, and making API calls safe to run in parallel
 
 The brief was to finish what Session 9 listed as remaining and to write

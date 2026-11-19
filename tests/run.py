@@ -113,6 +113,8 @@ def run_unit() -> bool:
     for title, cmd, cwd in (
         ("unit: dispensing comparison", [PY, "-m", "tests.test_dispense"], ROOT / "ml_pipeline"),
         ("unit: API-calling layer (fake client, no key)", [PY, "-m", "tests.test_reader"], ROOT / "ml_pipeline"),
+        ("unit: Koncile reader (fake Koncile server, no key)", [PY, "-m", "tests.test_koncile_reader"],
+         ROOT / "ml_pipeline"),
         ("unit: encryption, rate limiter, SMS delivery", [PY, "tests/test_security.py"], ROOT),
     ):
         banner(title)

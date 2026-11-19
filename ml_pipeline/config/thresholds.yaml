@@ -69,3 +69,14 @@ reading:
   # corrections is T0 (§16.4).
   confident_read: 0.60
   abstain_below: 0.45
+
+  # Per reading service. Each scores confidence on its own scale, so a number
+  # calibrated on one means nothing on another. A service with no entry here
+  # (Claude) uses the two numbers above. vlm/vocab.py: thresholds_for().
+  profiles:
+    koncile:
+      # GUESSES. The one page seen so far (VLM_CHECK/2.jpg in the Koncile app)
+      # scored its fields 85-97%; on that scale 0.60 would never gate anything.
+      # Calibrate against doctor corrections like the numbers above (T0).
+      confident_read: 0.90
+      abstain_below: 0.50

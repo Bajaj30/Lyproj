@@ -248,6 +248,9 @@ def health():
         # The UI shows a "demo reader" banner while this is true. Adding
         # ANTHROPIC_API_KEY to .env and restarting turns it off.
         "reader_is_mock": pipeline.is_mock(),
+        # Pack photos can be on the demo reader while pages are real (Koncile
+        # reads pages; packs need the Claude reader). The pharmacy banner uses this.
+        "pack_reader_is_mock": pipeline.pack_is_mock(),
         "api_key_configured": api_key_configured(),
         # ok | auth_error | model_unavailable | unreachable | not_run (mock).
         # A free check made at startup, so a wrong key shows here at once.

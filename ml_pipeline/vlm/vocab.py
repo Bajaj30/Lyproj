@@ -76,10 +76,19 @@ class Thresholds:
     is_target_region: bool
 
 
-@lru_cache(maxsize=1)
-def load_config(path: Path = CONFIG_PATH) -> Thresholds:
-    cfg = yaml.safe_load(Path(path).read_text())
-    m, r, v, n = cfg["matching"], cfg["reading"], cfg["vocabulary"], cfg.get("nlem", {})
+@lru_cache(maxsize=4)
+def _raw_config(path: Path = CONFIG_PATH) -> dict:
+    return yaml.safe_load(Path(path).read_text())
+
+
+@lru_cache(maxsize=8)
+def load_config(path: Path = CONFIG_PATH, profile: Optional[str] = None) -> Thresholds:
+    """Thresholds; `profile` overlays reading.profiles.<profile> on the reading numbers."""
+    cfg = _raw_config(path)
+    m, v, n = cfg["matching"], cfg["vocabulary"], cfg.get("nlem", {})
+    r = dict(cfg["reading"])
+    if profile:
+        r.update((cfg["reading"].get("profiles") or {}).get(profile) or {})
     return Thresholds(
         confirm_score=float(m["confirm_score"]),
         confirm_margin=float(m["confirm_margin"]),
@@ -92,6 +101,16 @@ def load_config(path: Path = CONFIG_PATH) -> Thresholds:
         region=v.get("region", "unknown"),
         is_target_region=bool(v.get("is_target_region", False)),
     )
+
+
+def thresholds_for(model: Optional[str], path: Path = CONFIG_PATH) -> Thresholds:
+    """The thresholds for pages read by `model`. Each reading service scores
+    confidence on its own scale, so it may have its own reading numbers under
+    reading.profiles. A model with no profile (Claude) gets the top-level ones,
+    exactly as before profiles existed."""
+    profiles = (_raw_config(path).get("reading", {}).get("profiles") or {})
+    key = (model or "").split(":")[0]
+    return load_config(path, key if key in profiles else None)
 
 
 # Route and timing tokens. Hospital prescriptions are written

@@ -1,0 +1,62 @@
+# How the fields of YOUR Koncile template map onto PageRead (vlm/koncile_reader.py).
+#
+# Koncile returns whatever fields the template in the Koncile app defines, under
+# the names given there ("Doctor's name", "Patient's name", ...). This file says
+# which of those names fills which PageRead field, so renaming a field in Koncile
+# is an edit here, not a code change.
+#
+# How a rule matches a field name (case-insensitive; punctuation ignored):
+#   match:   a list of alternatives, tried IN ORDER. An alternative matches a
+#            field when every word in it begins some word of the field name
+#            ("diagnos" matches "Diagnosis"; ["patient", "name"] matches
+#            "Patient's name"). The first alternative that matches any field wins.
+#   exclude: a field containing a word that begins with any of these never matches
+#            (keeps "Patient's date of birth" out of the prescription date).
+#
+# Editing this file changes what a page reads as, so it is part of the read
+# cache key: cached readings are redone after an edit.
+
+# The template uploads go to, found by name in your Koncile folders. Set
+# KONCILE_TEMPLATE_ID in .env to pin one instead.
+template_name: prescription
+
+general:
+  # "Is this document indeed a prescription?" -> False makes the page
+  # not_a_prescription, which lists no medicines (schemas.py: PageRead).
+  is_prescription:
+    match: [[indeed, prescription], [is, prescription], [prescription, document]]
+    exclude: [valid, still, date, place, issu]
+  patient_name:
+    match: [[patient, name], [patient]]
+    exclude: [birth, age, date, sex, gender, weight, address, phone, additional, informat]
+  prescriber_name:
+    match: [[doctor, name], [prescriber, name], [physician, name], [doctor], [prescriber]]
+    exclude: [phone, address, number, identif, registr, speciali, expertise, field, signature]
+  date:
+    match: [[prescription, issue, date], [issue, date], [prescription, date], [date]]
+    exclude: [birth, expir, valid]
+  diagnosis:
+    match: [[diagnos], [condition], [complaint], [symptom], [additional, information]]
+  # Used only when the template has no line fields: a general field holding the
+  # medicines, one per list item or per line.
+  medicines:
+    match: [[medic], [drug], [treatment], [prescribed]]
+
+# When Line_fields holds several named tables, the medicines table is chosen by this.
+table:
+  match: [[medic], [drug], [treatment], [prescri]]
+
+# Columns of one medicine row.
+lines:
+  drug:
+    match: [[medic, name], [drug, name], [product, name], [brand], [medic], [drug], [medicine], [product], [name]]
+    exclude: [dos, strength, freq, durat, instruc, quantit, route]
+  dosage:
+    match: [[dosage], [dose], [strength]]
+    exclude: [freq]
+  frequency:
+    match: [[freq], [posolog], [schedule], [times]]
+  duration:
+    match: [[durat], [days], [period]]
+  instructions:
+    match: [[instruc], [note], [comment], [route], [timing], [direction]]

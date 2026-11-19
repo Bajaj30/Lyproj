@@ -22,3 +22,6 @@ cryptography==50.0.2
 alembic==1.20.1
 # QR code on the prescription PDF (pure Python, no Pillow plugin needed).
 segno==1.6.6
+# The Koncile page reader (ml_pipeline/vlm/koncile_reader.py). The Anthropic SDK
+# brings its own HTTP stack (httpx2), so this is a separate dependency.
+httpx==0.28.1

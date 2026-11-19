@@ -61,6 +61,34 @@ class ReaderTruncated(RuntimeError):
     """The reply hit max_tokens. A truncated PageRead is a failed read, never a short one."""
 
 
+# Provider-neutral failures, for readers that do not use the Anthropic SDK (the
+# Koncile reader). They map onto the same user-facing messages as the SDK's own
+# errors in describe_error(), so a doctor sees one wording whichever service reads.
+
+class ReaderAuthError(RuntimeError):
+    """The reading service rejected the API key."""
+
+
+class ReaderQuotaExceeded(RuntimeError):
+    """The reading service's credits or quota are used up."""
+
+
+class ReaderBusy(RuntimeError):
+    """Rate limited or overloaded: worth trying again shortly."""
+
+
+class ReaderTimedOut(RuntimeError):
+    """The reading service did not finish in time."""
+
+
+class ReaderUnavailable(RuntimeError):
+    """The reading service could not be reached, or failed on its side."""
+
+
+class ReaderFailed(RuntimeError):
+    """The reading service processed the page and reported that it could not read it."""
+
+
 @dataclass
 class Completed:
     """One finished API call: the parsed output plus what the correction log needs."""
@@ -221,6 +249,18 @@ def describe_error(exc: BaseException) -> tuple:
         return 502, "The reading was cut off before it finished. Try again, or photograph the page in two halves."
     if isinstance(exc, FileNotFoundError):
         return 503, "The medicine database is not installed on this server. Tell the administrator."
+    if isinstance(exc, ReaderAuthError):
+        return 502, "The reading service is not set up correctly (API key). Tell the administrator."
+    if isinstance(exc, ReaderQuotaExceeded):
+        return 503, "The reading service's credits are used up. Tell the administrator."
+    if isinstance(exc, ReaderBusy):
+        return 503, "The reading service is busy. Try again in a minute."
+    if isinstance(exc, ReaderTimedOut):
+        return 504, "The reading service did not answer in time. Try again."
+    if isinstance(exc, ReaderUnavailable):
+        return 503, "The reading service is having trouble. Try again in a minute."
+    if isinstance(exc, ReaderFailed):
+        return 422, "The reading service could not process this image. Try a clearer photo."
     try:
         import anthropic
     except ImportError:

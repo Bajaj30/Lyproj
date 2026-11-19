@@ -77,6 +77,14 @@ def api_key_configured() -> bool:
     return key not in _PLACEHOLDER_KEYS and "..." not in key and len(key) >= 20
 
 
+def koncile_key_configured() -> bool:
+    """True when KONCILE_API_KEY holds something that could be a real key
+    (vlm/koncile_reader.py). Shallow, like api_key_configured()."""
+    load_env()
+    key = (os.environ.get("KONCILE_API_KEY") or "").strip()
+    return key not in _PLACEHOLDER_KEYS and "..." not in key and len(key) >= 16
+
+
 def has(name: str) -> bool:
     load_env()
     return bool(os.environ.get(name))

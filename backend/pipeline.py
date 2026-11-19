@@ -28,7 +28,7 @@ from schemas import Outcome, ResolvedMedicine, VerificationTier
 from vlm.client import describe_error
 from vlm.page_reader import ReadResult, build_reader, read_many, resolve_reader_kind
 from vlm.prompts import PROMPT_VERSION
-from vlm.vocab import _describe, _describe_ingredient, load_config, resolve_page
+from vlm.vocab import _describe, _describe_ingredient, load_config, resolve_page, thresholds_for
 
 READER_SETTING = os.environ.get("READER", "auto")
 
@@ -61,22 +61,32 @@ def init() -> None:
 
         print(f"[API] WARNING: the medicine CSVs are not in {DATA_DIR}. Brand matching cannot run, "
               f"so every upload will fail until they are added (README §9).", flush=True)
+    if reader_kind == "koncile":
+        print("[API] Pages are read by Koncile. Photographed PACKS (pharmacy, stage 6) still use the demo "
+              "pack reader, which needs ANTHROPIC_API_KEY to read real labels; QR and typed checks are real.",
+              flush=True)
     if reader_kind.startswith("mock"):
         reader_check = "not_run"
         print("[API] READER is the MOCK: every page reads as the same demo prescription. "
               "Add ANTHROPIC_API_KEY to .env and restart to read real pages.", flush=True)
-    elif caller is not None:
+    else:
         # Tell the operator NOW whether the key works, not at the first upload.
-        # One free metadata call, off the startup path so a slow network never
-        # delays the server.
+        # One free call, off the startup path so a slow network never delays
+        # the server. Claude: a model lookup. Koncile: its check_api_key route.
+        inner = getattr(reader, "inner", reader)
+        check_access = caller.check_access if caller is not None else getattr(inner, "check_access", None)
+        if check_access is None:
+            return
+
         def probe() -> None:
             global reader_check
-            reader_check = caller.check_access(reader.model)
+            reader_check = check_access(reader.model)
+            key_name = "KONCILE_API_KEY" if reader_kind == "koncile" else "ANTHROPIC_API_KEY"
             if reader_check == "ok":
                 print(f"[API] API key accepted; {reader.model} is available.", flush=True)
             else:
                 print(f"[API] WARNING: reader check failed ({reader_check}). Page reads will "
-                      f"fail until ANTHROPIC_API_KEY and the model are right.", flush=True)
+                      f"fail until {key_name} (and the model) are right.", flush=True)
 
         threading.Thread(target=probe, daemon=True).start()
 
@@ -104,10 +114,18 @@ def is_mock() -> bool:
     return reader_kind.startswith("mock")
 
 
+def pack_is_mock() -> bool:
+    """Whether a photographed PACK is read by the mock. Separate from is_mock():
+    with Koncile reading prescriptions, pack photos still need the Claude pack
+    reader, so they can be the mock while pages are real. The pharmacy's
+    "Demo reader" banner must follow this, or a sample pack reads as real."""
+    return bool(getattr(pack_reader, "is_mock", True))
+
+
 def _provenance(r: ReadResult) -> dict:
     """Fields 1 and 2 of models.py §16.3, taken from THIS read's own result."""
     return dict(
-        model=r.model, prompt_version=PROMPT_VERSION, effort=r.effort,
+        model=r.model, prompt_version=r.prompt_version or PROMPT_VERSION, effort=r.effort,
         raw_response=json.dumps(r.raw_response),
         cost_usd=r.cost_usd, from_cache=r.from_cache,
     )
@@ -117,7 +135,8 @@ def read_page(source: Union[bytes, NormalisedImage]):
     """S0-S3. Returns (page, resolved medicine dicts, normalised image, provenance)."""
     norm = source if isinstance(source, NormalisedImage) else normalise(source)   # S0
     result = reader.read_detailed(norm)                                           # S1
-    return result.page, resolve_page(result.page), norm, _provenance(result)      # S2 + S3
+    meds = resolve_page(result.page, thresholds_for(result.model))                # S2 + S3
+    return result.page, meds, norm, _provenance(result)
 
 
 def read_pages(sources: Sequence[Union[bytes, NormalisedImage]]) -> list:
@@ -130,7 +149,8 @@ def read_pages(sources: Sequence[Union[bytes, NormalisedImage]]) -> list:
             out.append(result)
             continue
         try:
-            out.append((result.page, resolve_page(result.page), norm, _provenance(result)))
+            out.append((result.page, resolve_page(result.page, thresholds_for(result.model)), norm,
+                        _provenance(result)))
         except Exception as exc:        # e.g. the medicine dataset is missing
             out.append(exc)
     return out

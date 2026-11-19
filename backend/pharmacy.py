@@ -188,7 +188,7 @@ def _view(db: Session, g: AccessGrant, v) -> PharmacyPrescription:
         page_numbers=[p["page_no"] for p in snap.get("pages", [])],
         checks=[check_out(c) for c in checks],
         dispensing_state=dispensing_state(snap["medicines"], checks),
-        reader_is_mock=pipeline.is_mock(),
+        reader_is_mock=pipeline.pack_is_mock(),   # this screen reads PACKS, not pages
     )
 
 

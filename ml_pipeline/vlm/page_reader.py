@@ -82,6 +82,10 @@ class ReadResult:
     usage: Optional[dict] = None
     cost_usd: float = 0.0              # 0 for a cache hit: nothing was spent
     from_cache: bool = False
+    # What produced the reading, for the correction log. None means this
+    # module's PROMPT_VERSION (the Claude prompt); readers with their own
+    # instructions (Koncile: its mapping version) set it.
+    prompt_version: Optional[str] = None
 
 
 @runtime_checkable
@@ -241,7 +245,17 @@ class CachedPageReader:
         """Cache keys become filenames, so keep them to a filesystem-safe set."""
         return "".join(c if (c.isalnum() or c in "-.") else "-" for c in str(part))
 
+    def _identity(self) -> Optional[str]:
+        """A reader that is not driven by the Claude prompt (Koncile) names what
+        changes its output itself. Claude and the mock have no such method and
+        keep exactly the key they always had, so existing entries still hit."""
+        ident = getattr(self.inner, "cache_identity", None)
+        return ident() if callable(ident) else None
+
     def _key(self, img: NormalisedImage) -> str:
+        ident = self._identity()
+        if ident:
+            return "_".join(self._safe(p) for p in (img.sha256[:16], ident))
         effort = getattr(self.inner, "effort", None) or "none"
         return "_".join(
             self._safe(p)
@@ -273,7 +287,7 @@ class CachedPageReader:
             # The cached entry carries ITS OWN raw reply and usage, so a page
             # served from cache is stored with the reply that produced it.
             raw_response=payload.get("raw_response"), usage=payload.get("usage"),
-            cost_usd=0.0, from_cache=True,
+            cost_usd=0.0, from_cache=True, prompt_version=payload.get("prompt_version"),
         )
 
     def read_detailed(self, source: PageSource) -> ReadResult:
@@ -307,8 +321,8 @@ class CachedPageReader:
                     "model": self.inner.model,
                     "served_by": result.model,
                     "effort": result.effort,
-                    "prompt_version": PROMPT_VERSION,
-                    "prompt_fingerprint": prompt_fingerprint(),
+                    "prompt_version": result.prompt_version or PROMPT_VERSION,
+                    "prompt_fingerprint": self._identity() or prompt_fingerprint(),
                     "image_sha256": img.sha256,
                     "image_size": [img.width, img.height],
                 },
@@ -467,9 +481,13 @@ def resolve_reader_kind(kind: str = "auto") -> str:
     """
     if kind != "auto":
         return kind
-    from env import api_key_configured
+    from env import api_key_configured, koncile_key_configured
 
-    return "claude" if api_key_configured() else "mock"
+    # An Anthropic key keeps priority, so adding a Koncile key never changes a
+    # deployment that already reads with Claude.
+    if api_key_configured():
+        return "claude"
+    return "koncile" if koncile_key_configured() else "mock"
 
 
 def build_reader(
@@ -488,6 +506,10 @@ def build_reader(
         inner = MockPageReader(document_type="not_a_prescription")
     elif kind == "claude":
         inner = ClaudePageReader(model=model, effort=effort, caller=caller)
+    elif kind == "koncile":
+        from vlm.koncile_reader import KoncilePageReader
+
+        inner = KoncilePageReader()
     else:
         raise ValueError(f"unknown reader kind {kind!r}")
     return CachedPageReader(inner) if cache else inner
@@ -498,7 +520,7 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description="Run S1 on one or more pages.")
     ap.add_argument("images", nargs="+")
-    ap.add_argument("--reader", default="auto", choices=["auto", "claude", "mock", "mock_negative"])
+    ap.add_argument("--reader", default="auto", choices=["auto", "claude", "koncile", "mock", "mock_negative"])
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--effort", default=DEFAULT_EFFORT)
     ap.add_argument("--no-cache", action="store_true")
